@@ -1,0 +1,34 @@
+# Credentials
+.env
+
+# Database
+data/TypeOneZen.db
+data/TypeOneZen.db-shm
+data/TypeOneZen.db-wal
+
+# Import data (CSVs, FIT files — may contain personal health data)
+data/imports/
+
+# Generated summaries
+summaries/
+
+# Logs
+logs/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# macOS
+.DS_Store
+
+# IDE
+.vscode/
+.idea/
+
+# Claude Code
+.claude/
+
+# Working notes
+plan.md
