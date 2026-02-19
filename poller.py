@@ -13,9 +13,8 @@ from pathlib import Path
 from dotenv import load_dotenv
 import os
 
-from pydexcom import Dexcom, Region
-
 from db import get_db
+from dexcom_client import fetch_latest_reading
 
 # -- Paths --
 PROJECT_DIR = Path.home() / "TypeOneZen"
@@ -45,32 +44,18 @@ logger.addHandler(file_handler)
 
 def poll() -> None:
     """Fetch the latest Dexcom reading and store it if new."""
-    username = os.getenv("DEXCOM_USERNAME")
-    password = os.getenv("DEXCOM_PASSWORD")
-    outside_us = os.getenv("DEXCOM_OUTSIDE_US", "false").lower() == "true"
+    logger.info("Fetching latest reading from Dexcom Share")
+    result = fetch_latest_reading()
 
-    if not username or not password:
-        logger.error("DEXCOM_USERNAME and DEXCOM_PASSWORD must be set in .env")
-        print("Error: missing Dexcom credentials. See .env.example.")
+    if result is None:
+        logger.error("Failed to fetch reading from Dexcom (credentials, network, or API error)")
+        print("Error: could not fetch reading from Dexcom.")
         sys.exit(1)
 
-    # Connect to Dexcom Share
-    region = Region.OUS if outside_us else Region.US
-    logger.info("Connecting to Dexcom Share (region=%s)", region)
-    dexcom = Dexcom(username=username, password=password, region=region)
-
-    # Fetch the latest reading
-    reading = dexcom.get_current_glucose_reading()
-    if reading is None:
-        logger.warning("No glucose reading returned from Dexcom")
-        print("No reading available from Dexcom.")
-        sys.exit(0)
-
-    # Convert timestamp to ISO8601 UTC string
-    timestamp = reading.datetime.isoformat()
-    mg_dl = reading.value
-    trend = reading.trend_description
-    trend_arrow = reading.trend_arrow
+    timestamp = result["timestamp_iso"]
+    mg_dl = result["glucose_mg_dl"]
+    trend = result["trend"]
+    trend_arrow = result["trend_arrow"]
 
     logger.info(
         "Fetched reading: %d mg/dL %s (%s) at %s",
