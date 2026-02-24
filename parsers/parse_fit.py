@@ -17,6 +17,86 @@ from pathlib import Path
 from typing import Optional
 
 from fitparse import FitFile
+from fitparse.profile import BASE_TYPES, MESSAGE_TYPES
+from fitparse.base import (
+    DefinitionMessage,
+    DevFieldDefinition,
+    FieldDefinition,
+    get_dev_type,
+)
+
+# ---------------------------------------------------------------------------
+# Monkey-patch fitparse to tolerate non-standard FIT files (e.g. COROS ski/
+# cardio activities) that declare a field size that isn't a multiple of the
+# base type size.  Upstream fitparse raises FitParseError; the comment in
+# the source says "we could fall back to byte encoding".  We do exactly that.
+# ---------------------------------------------------------------------------
+_BASE_TYPE_BYTE = BASE_TYPES[13]  # byte type, size=1
+
+
+def _lenient_parse_definition_message(self, header):
+    endian = ">" if self._read_struct("xB") else "<"
+    global_mesg_num, num_fields = self._read_struct("HB", endian=endian)
+    mesg_type = MESSAGE_TYPES.get(global_mesg_num)
+    field_defs = []
+
+    for _ in range(num_fields):
+        field_def_num, field_size, base_type_num = self._read_struct(
+            "3B", endian=endian
+        )
+        field = mesg_type.fields.get(field_def_num) if mesg_type else None
+        base_type = BASE_TYPES.get(base_type_num, _BASE_TYPE_BYTE)
+
+        if (field_size % base_type.size) != 0:
+            base_type = _BASE_TYPE_BYTE  # fall back instead of raising
+
+        if field and field.components:
+            for component in field.components:
+                if component.accumulate:
+                    accumulators = self._accumulators.setdefault(
+                        global_mesg_num, {}
+                    )
+                    accumulators[component.def_num] = 0
+
+        field_defs.append(
+            FieldDefinition(
+                field=field,
+                def_num=field_def_num,
+                base_type=base_type,
+                size=field_size,
+            )
+        )
+
+    dev_field_defs = []
+    if header.is_developer_data:
+        num_dev_fields = self._read_struct("B", endian=endian)
+        for _ in range(num_dev_fields):
+            field_def_num, field_size, dev_data_index = self._read_struct(
+                "3B", endian=endian
+            )
+            field = get_dev_type(dev_data_index, field_def_num)
+            dev_field_defs.append(
+                DevFieldDefinition(
+                    field=field,
+                    dev_data_index=dev_data_index,
+                    def_num=field_def_num,
+                    size=field_size,
+                )
+            )
+
+    def_mesg = DefinitionMessage(
+        header=header,
+        endian=endian,
+        mesg_type=mesg_type,
+        mesg_num=global_mesg_num,
+        field_defs=field_defs,
+        dev_field_defs=dev_field_defs,
+    )
+    self._local_mesgs[header.local_mesg_num] = def_mesg
+    return def_mesg
+
+
+FitFile._parse_definition_message = _lenient_parse_definition_message
 
 # FIT sport enum → human-readable activity type
 # Reference: FIT SDK Profile.xlsx sport enum
@@ -40,6 +120,9 @@ SPORT_MAP = {
     "transition": "transition",
     "multisport": "multisport",
     "e_biking": "e_biking",
+    "alpine_skiing": "alpine_skiing",
+    "cross_country_skiing": "cross_country_skiing",
+    "snowboarding": "snowboarding",
     "generic": "other",
 }
 
@@ -94,14 +177,13 @@ def parse_fit_file(fit_path: Path) -> dict | None:
     """Parse a single .fit file and return a workout dict, or None on error."""
     try:
         ff = FitFile(str(fit_path))
+        session_data = {}
+        for record in ff.get_messages("session"):
+            for field in record.fields:
+                session_data[field.name] = field.value
     except Exception as e:
         print(f"  ERROR parsing {fit_path.name}: {e}")
         return None
-
-    session_data = {}
-    for record in ff.get_messages("session"):
-        for field in record.fields:
-            session_data[field.name] = field.value
 
     if not session_data:
         print(f"  SKIP {fit_path.name}: no session record found")
