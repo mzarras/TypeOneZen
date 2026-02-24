@@ -16,6 +16,51 @@ Designed to work with [OpenClaw](https://github.com/openclaw/openclaw) — an al
 - **SQLite storage** — Everything in one local database, indexed for fast time-range queries
 - **OpenClaw skill** — Pre-built agent skill for natural-language BG queries, meal logging, and more
 
+## Talk to Your Data Over iMessage
+
+TypeOneZen pairs with [OpenClaw](https://github.com/openclaw/openclaw) to give you something no diabetes app offers: **a personal AI agent you text over iMessage that actually knows your numbers.**
+
+Snap a photo of your lunch — it estimates macros and logs the meal. Send a pump screenshot — it reads the bolus and logs it correctly. Ask "how's my BG?" at 2am — it answers with your actual data, not a generic chart. It's your diabetes notebook, your pattern spotter, and your second brain, all in a conversation thread you already check every day.
+
+### What it looks like
+
+```
+You:     [photo of tacos]
+Zenbot:  Logging: tacos — 52g carbs, 24g protein, 18g fat. Confirm?
+You:     yep
+Zenbot:  Logged. BG is 142 ↗ — I'll watch for a spike.
+
+You:     what's my bg
+Zenbot:  118 mg/dL → flat. Last reading 2 min ago.
+
+You:     how was my overnight?
+Zenbot:  Overnight avg was 138, TIR 91%. You dipped to 74 at 3am
+         but recovered on your own. No lows flagged.
+
+You:     should I correct?
+Zenbot:  BG is 215 rising slowly. Last bolus was 2h ago, IOB ~0.4u.
+         You've been above 180 for 45 min. Here's the context —
+         your call.
+```
+
+### Proactive alerts, not just answers
+
+The system doesn't wait for you to ask. It texts you when something matters:
+
+- **Post-meal spike** — BG rockets >60 mg/dL above your pre-meal baseline
+- **Sustained high** — Stuck above 200 for 90+ minutes
+- **Rapid drop** — Falling >30 mg/dL in 30 minutes
+- **Overnight high** — Above 160 for an hour between 11pm–7am
+- **Morning & evening summaries** — Data-backed daily briefings with TIR, insulin totals, workout impact, pattern insights, and overnight risk assessment
+
+All alerts deduplicate on a 2-hour window so you never get spammed.
+
+### Why iMessage?
+
+No app to install. No dashboard to check. No login to remember. The data comes to you in the same place your friends and family text you. You respond in plain English. That's it.
+
+> **Important:** Zenbot never gives medical advice. It provides data-driven context — your numbers, your patterns, your history — to support your own decisions. Always consult your endocrinologist for treatment changes.
+
 ## Architecture
 
 ```
