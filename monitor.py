@@ -57,23 +57,23 @@ SCHEDULE_URGENT  = [0, 15, 15, 15, 15]    # For lows (LOW_WARNING)
 
 # ── Dexcom trend descriptions → numeric rate mapping ───────────────
 TREND_RATES = {
-    "DoubleUp":      30,
-    "SingleUp":      15,
-    "FortyFiveUp":    7,
-    "Flat":           0,
-    "FortyFiveDown": -7,
-    "SingleDown":   -15,
-    "DoubleDown":   -30,
+    "rising quickly":  30,
+    "rising":          15,
+    "rising slightly":  7,
+    "steady":           0,
+    "falling slightly": -7,
+    "falling":         -15,
+    "falling quickly": -30,
 }
 
 TREND_ARROWS = {
-    "DoubleUp":      "\u21c8",   # ⇈
-    "SingleUp":      "\u2191",   # ↑
-    "FortyFiveUp":   "\u2197",   # ↗
-    "Flat":          "\u2192",   # →
-    "FortyFiveDown": "\u2198",   # ↘
-    "SingleDown":    "\u2193",   # ↓
-    "DoubleDown":    "\u21ca",   # ⇊
+    "rising quickly":  "\u21c8",   # ⇈
+    "rising":          "\u2191",   # ↑
+    "rising slightly": "\u2197",   # ↗
+    "steady":          "\u2192",   # →
+    "falling slightly":"\u2198",   # ↘
+    "falling":         "\u2193",   # ↓
+    "falling quickly": "\u21ca",   # ⇊
 }
 
 
@@ -885,7 +885,7 @@ def rule_low_warning(conn) -> list[dict]:
         return []
 
     # Follow-up re-check: if BG has stabilized since initial alert, suppress
-    if level > 0 and current_bg >= 85 and description in ("stable", "rising"):
+    if level > 0 and current_bg >= 80 and description in ("stable", "rising"):
         return []
 
     current_time = fmt_time_ny(current_ts)
