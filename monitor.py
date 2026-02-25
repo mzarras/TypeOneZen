@@ -838,9 +838,16 @@ def rule_low_warning(conn) -> list[dict]:
     """Rule 6: Low warning — catches gradual lows that RAPID_DROP misses.
 
     Fires when:
-      (a) BG < 100 and falling (rate < -5/15min), OR
-      (b) BG < 120 and IOB > 0.5u, OR
-      (c) BG < 85 (regardless of trend)
+      (a) Projected BG in 15 min < 80 (i.e. current_bg + rate < 80), OR
+      (b) BG < 90 AND IOB > 0.5u AND actively falling (rate < -5/15min), OR
+      (c) BG < 80 (already below threshold, regardless of trend)
+
+    Does NOT fire when:
+      - BG >= 80 AND trend is stable or rising — covers normal overnight
+        fluctuation patterns like 80→88→90→82→90→95.
+
+    Follow-up alerts (level > 0) re-verify conditions before firing.
+    If BG has stabilized (>= 85 and stable/rising), follow-ups are suppressed.
 
     Uses SCHEDULE_URGENT (15-min cadence) since lows are time-sensitive.
     """
@@ -852,14 +859,20 @@ def rule_low_warning(conn) -> list[dict]:
     current_bg = trend["current_bg"]
     current_ts = trend["current_ts"]
     rate = trend["rate_per_15"]
+    description = trend["description"]  # "stable", "rising", or "falling"
 
     iob = estimate_iob(conn)
     est_drop = round(iob * ISF)
 
+    # Suppression: BG >= 80 and stable/rising → normal fluctuation, don't alert
+    if current_bg >= 80 and description in ("stable", "rising"):
+        return []
+
     # Check trigger conditions
-    condition_a = current_bg < 100 and rate < -5
-    condition_b = current_bg < 120 and iob > 0.5
-    condition_c = current_bg < 85
+    projected_bg = current_bg + rate   # estimated BG in ~15 min
+    condition_a = projected_bg < 80    # projected to cross below 80 in 15 min
+    condition_b = current_bg < 90 and iob > 0.5 and rate < -5  # near-low + IOB + falling
+    condition_c = current_bg < 80      # already below 80
 
     if not (condition_a or condition_b or condition_c):
         return []
@@ -869,6 +882,10 @@ def rule_low_warning(conn) -> list[dict]:
     should_fire, level = should_escalate(history, SCHEDULE_URGENT)
 
     if not should_fire:
+        return []
+
+    # Follow-up re-check: if BG has stabilized since initial alert, suppress
+    if level > 0 and current_bg >= 85 and description in ("stable", "rising"):
         return []
 
     current_time = fmt_time_ny(current_ts)
@@ -882,7 +899,7 @@ def rule_low_warning(conn) -> list[dict]:
         if condition_a or condition_c:
             msg = (
                 f"\u26a0\ufe0f Low warning: BG {current_bg}{trend['arrow']} and falling "
-                f"({rate:+.0f}/15min). {iob_note}\n"
+                f"({rate:+.0f}/15min, projected {round(projected_bg)} in 15min). {iob_note}\n"
                 f"~15-20g fast carbs recommended."
             )
         else:

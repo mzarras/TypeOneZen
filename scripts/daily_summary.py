@@ -25,6 +25,7 @@ load_dotenv(dotenv_path=str(Path.home() / "TypeOneZen" / ".env"))
 DB_PATH = Path.home() / "TypeOneZen" / "data" / "TypeOneZen.db"
 IMSG = "/opt/homebrew/bin/imsg"
 PHONE = os.getenv("ALERT_PHONE", "")
+USER_NAME = os.getenv("USER_NAME", "there")
 NY = ZoneInfo("America/New_York")
 UTC = timezone.utc
 
@@ -409,9 +410,9 @@ def build_morning():
     bg = get_current_bg()
     if bg:
         stale = f" (sensor reading is {round(bg['age_min'])}m old)" if bg["stale"] else ""
-        lines.append(f"Good morning Michael 🩺 BG is {bg['bg']} {bg['arrow']}{stale}")
+        lines.append(f"Good morning {USER_NAME} 🩺 BG is {bg['bg']} {bg['arrow']}{stale}")
     else:
-        lines.append("Good morning Michael 🩺 No CGM data available right now.")
+        lines.append(f"Good morning {USER_NAME} 🩺 No CGM data available right now.")
     lines.append("")
 
     # Overnight
