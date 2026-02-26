@@ -217,7 +217,7 @@ def get_iob():
     cutoff = now_ny() - timedelta(hours=AIT_HOURS)
     conn = get_db()
     rows = conn.execute(
-        "SELECT timestamp, units FROM insulin_doses WHERE timestamp >= ? AND type IN ('meal','correction')",
+        "SELECT timestamp, units FROM insulin_doses WHERE timestamp >= ? AND type IN ('bolus','correction')",
         (to_utc_str(cutoff),)
     ).fetchall()
     conn.close()
