@@ -22,6 +22,48 @@ def get_db() -> sqlite3.Connection:
     return conn
 
 
+def ensure_sync_schema(conn: sqlite3.Connection) -> None:
+    """Migrate schema for external-sync support (Nightscout). Safe to re-run.
+
+    - Adds a nullable `source_id` column (external record ID, e.g. the
+      Nightscout `_id`) to glucose_readings, insulin_doses, and meals.
+      Existing rows are preserved (ALTER TABLE ADD COLUMN leaves them
+      intact with source_id = NULL).
+    - Creates unique indexes on source_id where not null, so synced rows
+      are idempotent.
+    - Creates the `sync_state` table (per-stream sync cursors).
+    """
+    # Add source_id column if the tables already existed without it
+    for table in ("glucose_readings", "insulin_doses", "meals"):
+        cols = [row["name"] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()]
+        if cols and "source_id" not in cols:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN source_id TEXT")
+
+    # Unique where not null — manual/Dexcom/Glooko rows (source_id NULL) are unaffected
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_glucose_source_id
+        ON glucose_readings(source_id) WHERE source_id IS NOT NULL
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_insulin_source_id
+        ON insulin_doses(source_id) WHERE source_id IS NOT NULL
+    """)
+    conn.execute("""
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_meals_source_id
+        ON meals(source_id) WHERE source_id IS NOT NULL
+    """)
+
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sync_state (
+            key         TEXT PRIMARY KEY,  -- e.g. 'nightscout_entries'
+            value       TEXT NOT NULL,     -- cursor / state value
+            updated_at  TEXT DEFAULT (datetime('now'))
+        )
+    """)
+
+    conn.commit()
+
+
 def init_db() -> None:
     """Create all tables if they do not already exist."""
     conn = get_db()
@@ -35,6 +77,7 @@ def init_db() -> None:
             trend       TEXT,              -- e.g. Flat, FortyFiveUp
             trend_arrow TEXT,              -- e.g. ->
             source      TEXT    DEFAULT 'dexcom',
+            source_id   TEXT,              -- external record ID (e.g. Nightscout _id)
             created_at  TEXT    DEFAULT (datetime('now'))
         )
     """)
@@ -46,6 +89,7 @@ def init_db() -> None:
             units       REAL    NOT NULL,
             type        TEXT,              -- bolus, basal, correction
             notes       TEXT,
+            source_id   TEXT,              -- external record ID (e.g. Nightscout _id)
             created_at  TEXT    DEFAULT (datetime('now'))
         )
     """)
@@ -73,8 +117,9 @@ def init_db() -> None:
             fiber_g         REAL,              -- fiber blunts BG impact
             calories        INTEGER,
             glycemic_load   REAL,              -- optional, can be computed later
-            source          TEXT    DEFAULT 'manual',  -- 'manual', 'photo', 'message'
+            source          TEXT    DEFAULT 'manual',  -- 'manual', 'photo', 'message', 'nightscout'
             notes           TEXT,              -- extra context
+            source_id       TEXT,              -- external record ID (e.g. Nightscout _id)
             created_at      TEXT    DEFAULT (datetime('now'))
         )
     """)
@@ -97,6 +142,10 @@ def init_db() -> None:
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_alert_log_rule_time ON alert_log(rule_name, triggered_at)")
 
     conn.commit()
+
+    # -- Migrations for pre-existing databases (preserve existing rows) --
+    ensure_sync_schema(conn)
+
     conn.close()
 
 
