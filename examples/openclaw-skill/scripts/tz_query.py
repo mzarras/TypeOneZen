@@ -3,6 +3,7 @@
 
 import argparse
 import json
+import os
 import sqlite3
 import subprocess
 import sys
@@ -13,6 +14,7 @@ from zoneinfo import ZoneInfo
 DB_PATH = Path.home() / "TypeOneZen" / "data" / "TypeOneZen.db"
 SUMMARY_PATH = Path.home() / "TypeOneZen" / "summaries" / "stats_cache.json"
 MONITOR_SCRIPT = Path.home() / "TypeOneZen" / "monitor.py"
+ENV_PATH = Path.home() / "TypeOneZen" / ".env"
 UTC = ZoneInfo("UTC")
 NY = ZoneInfo("America/New_York")
 
@@ -47,6 +49,66 @@ def out(data):
     print(json.dumps(data, indent=2))
 
 
+# ── Nightscout (live pump/loop data) ─────────────────────────────────
+
+def _load_nightscout_env():
+    """Load NIGHTSCOUT_URL/NIGHTSCOUT_TOKEN from ~/TypeOneZen/.env if not
+    already set in the environment. Stdlib-only (no dotenv dependency)."""
+    if not ENV_PATH.exists():
+        return
+    try:
+        for line in ENV_PATH.read_text().splitlines():
+            line = line.strip()
+            if not line or line.startswith("#") or "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            if key in ("NIGHTSCOUT_URL", "NIGHTSCOUT_TOKEN") and key not in os.environ:
+                os.environ[key] = value.strip().strip("'").strip('"')
+    except OSError:
+        pass
+
+
+def _nightscout_client():
+    """Return (client, error_dict_or_None). Client is None if unavailable."""
+    try:
+        from nightscout_client import NightscoutClient
+    except ImportError:
+        return None, {"error": "nightscout-client not installed"}
+    _load_nightscout_env()
+    if not os.environ.get("NIGHTSCOUT_URL"):
+        return None, {"error": "NIGHTSCOUT_URL not configured"}
+    return NightscoutClient.from_env(), None
+
+
+def fetch_nightscout_live():
+    """Live Nightscout context for `now`. Returns:
+      dict of live values on success,
+      {"error": ...} if Nightscout is unreachable/errors,
+      None if nightscout isn't installed/configured (SQLite-only mode).
+    """
+    client, err = _nightscout_client()
+    if client is None:
+        return None
+    try:
+        from nightscout_client.exceptions import NightscoutError
+        now = client.now()
+        pump = client.pump()
+        return {
+            "iob": now.get("iob"),
+            "cob": now.get("cob"),
+            "loop_status": pump.get("loop_status"),
+            "last_loop_minutes_ago": pump.get("last_loop_minutes_ago"),
+            "reservoir": pump.get("reservoir_display"),
+            "pod_age_hours": pump.get("pod_age_hours"),
+            "data_age_minutes": now.get("data_age_minutes"),
+        }
+    except NightscoutError as e:
+        return {"error": f"nightscout: {e}"}
+    except Exception as e:
+        return {"error": f"nightscout: {e}"}
+
+
 # ── Subcommands ──────────────────────────────────────────────────────
 
 def cmd_now(args):
@@ -68,13 +130,41 @@ def cmd_now(args):
         dt = dt.replace(tzinfo=UTC)
     mins_ago = (utc_now() - dt).total_seconds() / 60
 
+    # Live pump/loop context from Nightscout (degrades gracefully:
+    # null if not configured, {"error": ...} if unreachable)
     out({
         "glucose_mg_dl": row["glucose_mg_dl"],
         "trend": row["trend"],
         "trend_arrow": row["trend_arrow"],
         "timestamp_ny": to_ny(ts),
         "minutes_ago": round(mins_ago, 1),
+        "nightscout": fetch_nightscout_live(),
     })
+
+
+def cmd_pump(args):
+    """Live pump status from Nightscout (reservoir, pod age, loop status)."""
+    client, err = _nightscout_client()
+    if client is None:
+        out(err)
+        return
+    try:
+        from nightscout_client.exceptions import NightscoutError
+        pump = client.pump()
+    except NightscoutError as e:
+        out({"error": f"nightscout: {e}"})
+        return
+    except Exception as e:
+        out({"error": f"nightscout: {e}"})
+        return
+
+    result = dict(pump)
+    if result.get("site_changed_at"):
+        try:
+            result["site_changed_ny"] = to_ny(result["site_changed_at"])
+        except (ValueError, TypeError):
+            pass
+    out(result)
 
 
 def cmd_range(args):
@@ -297,7 +387,9 @@ def main():
     parser = argparse.ArgumentParser(description="TypeOneZen query tool")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    sub.add_parser("now", help="Current BG + trend")
+    sub.add_parser("now", help="Current BG + trend + live pump/loop context")
+
+    sub.add_parser("pump", help="Live pump status from Nightscout")
 
     p_range = sub.add_parser("range", help="BG stats over N hours")
     p_range.add_argument("hours", type=float)
@@ -318,6 +410,7 @@ def main():
 
     cmds = {
         "now": cmd_now,
+        "pump": cmd_pump,
         "range": cmd_range,
         "insulin": cmd_insulin,
         "meals": cmd_meals,
