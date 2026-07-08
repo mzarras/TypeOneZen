@@ -21,8 +21,9 @@ boluses), which arrive as many small bolus treatments. That is expected —
 they are stored individually as boluses and should be aggregated in
 summaries.
 
-This retires the manual Glooko CSV import workflow (parsers/parse_glooko.py
-is kept for historical imports).
+This covers ongoing data going forward. parsers/parse_glooko.py remains the
+backfill path for history that predates the Nightscout site (e.g. a fresh
+Nightscout deployment starts empty while Glooko holds years of data).
 
 Usage:
     python3 ns_sync.py                     # incremental sync from stored cursor
