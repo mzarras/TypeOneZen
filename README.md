@@ -12,7 +12,7 @@ Designed to work with [OpenClaw](https://github.com/openclaw/openclaw) — an al
 - **Live CGM polling** — Fetches Dexcom G7 readings every 5 minutes via the Share API (kept as a redundant BG source)
 - **Rule-based BG alerts** — Post-meal spikes, sustained highs, rapid drops, overnight highs — sent via iMessage with 2-hour dedup
 - **Pump alerts** — Low reservoir, pod age (80h hard stop), loop-not-looping — from live Nightscout pump state
-- **Multi-source data import** — Glooko CSV exports (insulin + BG, retired by the Nightscout sync), Garmin FIT files (workouts with HR zones)
+- **Multi-source data import** — Glooko CSV exports (insulin + BG — backfill for history predating Nightscout), Garmin FIT files (workouts with HR zones)
 - **Health summaries** — Auto-generated reports with time-in-range, insulin totals, workout-BG correlations, and pattern insights
 - **Meal logging** — Track meals with macros (carbs, protein, fat, fiber, calories)
 - **SQLite storage** — Everything in one local database, indexed for fast time-range queries
@@ -70,7 +70,7 @@ Dexcom G7 CGM        Nightscout (Trio + Omnipod 5)
       |                     |
       v                     v
   poller.py            ns_sync.py ──> SQLite DB <── parse_fit.py (Garmin FIT)
-  (every 5 min)        (every 5 min)      |      <── parse_glooko.py (legacy CSV)
+  (every 5 min)        (every 5 min)      |      <── parse_glooko.py (historical CSV)
                             |             |
                             |   ┌─────────┼──────────┐
                             |   v         v          v
@@ -144,7 +144,7 @@ With a Trio + Omnipod 5 closed loop reporting to Nightscout, the integration add
 - **Live pump/loop context** — `tz_query.py now` gains a `nightscout` block (IOB, COB, loop status, reservoir, pod age, data age) and a new `tz_query.py pump` command exposes full pump status. Both degrade gracefully when Nightscout is unreachable — history queries stay SQLite-only.
 - **Pump alert rules in `monitor.py`** — low reservoir (fires once on the downward crossing below 20u, resets after a pod change), pod age (72h warning + 78h urgent — pods hard-stop at 80h), loop-not-looping (devicestatus stale > 30 min), and a distinct Nightscout-unreachable alert so a dead site is never confused with a stalled loop.
 
-**This retires the Glooko CSV import workflow** — insulin and CGM data now arrive automatically instead of via manual exports. `parsers/parse_glooko.py` is kept for importing historical exports. **`poller.py` (Dexcom Share) stays in the crontab as a redundant BG source**; the sync deduplicates cross-source readings at minute granularity so the two never double-count.
+**Ongoing insulin and CGM data now arrive automatically** instead of via manual exports. `parsers/parse_glooko.py` remains the backfill path for history that predates the Nightscout site — a fresh Nightscout deployment starts empty, while Glooko exports hold years of history (import Glooko first, then `ns_sync.py --since` from the Nightscout go-live date to avoid overlap). **`poller.py` (Dexcom Share) stays in the crontab as a redundant BG source**; the sync deduplicates cross-source readings at minute granularity so the two never double-count.
 
 ## Usage
 
@@ -176,8 +176,8 @@ python3 monitor.py --dry-run  # Print what would alert, without sending
 python3 ns_sync.py
 python3 ns_sync.py --since 2026-01-01   # backfill from a date, re-run safe
 
-# Import Glooko CSV exports (LEGACY — retired by ns_sync.py; kept for
-# historical imports. Place files in data/imports/glooko/)
+# Import Glooko CSV exports (historical backfill — ns_sync.py covers ongoing
+# data. Place files in data/imports/glooko/)
 python3 parsers/parse_glooko.py
 
 # Import Garmin FIT workout files (place files in data/imports/fit/)
@@ -377,7 +377,7 @@ The suite uses a temp SQLite database and a mocked `nightscout_client` (no netwo
 - macOS (for iMessage alerting via `imsg` CLI)
 - Dexcom G7 with Share enabled
 - Optional: Nightscout site (Trio/AAPS/Loop uploading) for pump + loop data
-- Optional: Glooko account (legacy import), Garmin watch with COROS/Garmin Connect export
+- Optional: Glooko account (historical backfill), Garmin watch with COROS/Garmin Connect export
 
 ## License
 

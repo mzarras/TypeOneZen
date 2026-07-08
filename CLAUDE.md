@@ -30,7 +30,7 @@ python3 monitor.py --dry-run    # print alerts without sending
 python3 -m pytest tests/
 
 # Import data
-python3 parsers/parse_glooko.py   # LEGACY (retired by ns_sync.py) — import Glooko CSVs from data/imports/glooko/
+python3 parsers/parse_glooko.py   # import Glooko CSVs from data/imports/glooko/ (historical backfill; ns_sync.py covers ongoing data)
 python3 parsers/parse_fit.py      # import Garmin FIT files from data/imports/fit/
 
 # Generate health summary report
@@ -50,7 +50,7 @@ python3 parsers/backfill_meals_from_bolus.py   # extract meals from bolus notes
 **Core modules (project root):**
 - `db.py` — Schema definition, `get_db()` connection helper, table creation, sync-schema migration
 - `poller.py` — Dexcom Share API polling with deduplication. Credentials from `.env`. Kept as a redundant BG source alongside the Nightscout sync
-- `ns_sync.py` — Nightscout sync via `nightscout-client`: entries → `glucose_readings` (source `nightscout`), boluses/SMBs/temp basals → `insulin_doses`, pump-logged carbs → `meals`. Per-stream cursors in `sync_state`, idempotent via `source_id`, `--since` for backfill. Retires the Glooko CSV workflow (parser kept for historical imports)
+- `ns_sync.py` — Nightscout sync via `nightscout-client`: entries → `glucose_readings` (source `nightscout`), boluses/SMBs/temp basals → `insulin_doses`, pump-logged carbs → `meals`. Per-stream cursors in `sync_state`, idempotent via `source_id`, `--since` for backfill. Covers ongoing data; `parse_glooko.py` remains the backfill path for history that predates the Nightscout site
 - `monitor.py` — Rule-based BG alert rules (post-meal spike, sustained high, rapid drop, pre-workout low risk, overnight high, low warning) plus Nightscout pump rules (low reservoir with state-transition semantics, pod age 72h/78h, loop stale >30 min, Nightscout unreachable — the last two are deliberately distinct alerts). Sends iMessage via `/opt/homebrew/bin/imsg`. 2-hour dedup window prevents alert spam. Pump rules no-op if `nightscout-client` isn't installed/configured
 
 **Parsers (`parsers/`):**
@@ -59,7 +59,7 @@ python3 parsers/backfill_meals_from_bolus.py   # extract meals from bolus notes
 - `generate_summary.py` — Produces `summaries/health_context.md` and `summaries/stats_cache.json` with BG statistics, time-in-range, insulin totals, workout/meal-BG correlations, and auto-generated insights
 - `backfill_meals_from_bolus.py` — Extracts meal data from bolus insulin notes
 
-**Data flow:** Nightscout → `ns_sync.py` → SQLite ← `poller.py` (Dexcom API) ← `parse_fit.py` (FIT imports) ← `parse_glooko.py` (legacy CSV imports). Then `monitor.py` reads SQLite (plus live Nightscout pump state) for alerting and `generate_summary.py` reads it for reporting.
+**Data flow:** Nightscout → `ns_sync.py` → SQLite ← `poller.py` (Dexcom API) ← `parse_fit.py` (FIT imports) ← `parse_glooko.py` (historical CSV backfill). Then `monitor.py` reads SQLite (plus live Nightscout pump state) for alerting and `generate_summary.py` reads it for reporting.
 
 ## Key Conventions
 
