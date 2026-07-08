@@ -1,14 +1,17 @@
 """
 TypeOneZen — Zero-token rule-based BG monitor.
 
-Checks six rules against real CGM + meal data and sends iMessage alerts
-when thresholds are crossed. No AI — pure Python + SQLite.
+Checks BG rules against real CGM + meal data, plus pump/loop rules against
+live Nightscout state, and sends iMessage alerts when thresholds are
+crossed. No AI — pure Python + SQLite.
 
 Features:
 - Progressive alert cadence (escalating re-alerts for sustained conditions)
 - IOB estimation from bolus/correction doses
 - Snooze mechanism (DB-backed, CLI-controlled)
 - Richer context in alerts (IOB, trend, correction suggestions)
+- Pump rules via Nightscout: low reservoir, pod age, loop-not-looping
+  (these no-op if nightscout-client isn't installed/configured)
 
 Usage:
     python3 monitor.py            # Run all rules, send alerts
@@ -54,6 +57,24 @@ ICR = 4                 # Insulin-to-Carb Ratio (not used in alerting, for refer
 # ── Escalation schedules (minutes after previous alert) ────────────
 SCHEDULE_DEFAULT = [0, 30, 60, 60, 60]    # For highs (SUSTAINED, OVERNIGHT, POST_MEAL)
 SCHEDULE_URGENT  = [0, 15, 15, 15, 15]    # For lows (LOW_WARNING)
+
+# ── Nightscout pump/loop thresholds ─────────────────────────────────
+RESERVOIR_LOW_UNITS = 20.0   # low-reservoir alert threshold (units)
+POD_WARN_HOURS = 72          # pod age first warning
+POD_URGENT_HOURS = 78        # pod age urgent warning (pod hard-stops at 80h)
+POD_HARD_STOP_HOURS = 80
+LOOP_STALE_MINUTES = 30      # devicestatus older than this → loop-not-looping
+
+# Nightscout client is optional — pump/loop rules no-op if it isn't installed
+try:
+    from nightscout_client import NightscoutClient
+    from nightscout_client.exceptions import NightscoutError, NightscoutConnectionError
+    NIGHTSCOUT_AVAILABLE = True
+except ImportError:
+    NIGHTSCOUT_AVAILABLE = False
+
+# Set by main() so state-transition rules don't persist state in dry-run
+DRY_RUN = False
 
 # ── Dexcom trend descriptions → numeric rate mapping ───────────────
 TREND_RATES = {
@@ -394,6 +415,15 @@ def ensure_tables(conn):
             snoozed_at  TEXT NOT NULL,
             expires_at  TEXT NOT NULL,
             reason      TEXT
+        )
+    """)
+    # Key/value state store (shared with ns_sync.py) — used by the
+    # state-transition pump rules (e.g. low reservoir crossing).
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS sync_state (
+            key         TEXT PRIMARY KEY,
+            value       TEXT NOT NULL,
+            updated_at  TEXT DEFAULT (datetime('now'))
         )
     """)
     conn.commit()
@@ -930,6 +960,186 @@ def rule_low_warning(conn) -> list[dict]:
     return [{"rule": "LOW_WARNING", "message": msg}]
 
 
+# ── Nightscout pump/loop rules ──────────────────────────────────────
+#
+# These rules read live pump state (Omnipod 5 via Trio → Nightscout) with
+# the nightscout-client package. They no-op silently if the package isn't
+# installed or NIGHTSCOUT_URL isn't configured, so the BG rules above keep
+# working standalone.
+
+_ns_state = None  # per-run cache: {"pump": dict|None, "unreachable": bool, "error": str|None}
+
+
+def fetch_pump_state() -> dict:
+    """Fetch pump()/loop state from Nightscout once per run (cached).
+
+    Returns {"pump": dict or None, "unreachable": bool, "error": str or None}.
+    "unreachable" is True only for connection errors (site down / no network),
+    which is deliberately distinct from stale loop data (see rule_loop_stale).
+    """
+    global _ns_state
+    if _ns_state is not None:
+        return _ns_state
+
+    result = {"pump": None, "unreachable": False, "error": None}
+    if not NIGHTSCOUT_AVAILABLE or not os.getenv("NIGHTSCOUT_URL"):
+        result["error"] = "nightscout not configured"
+        _ns_state = result
+        return result
+
+    try:
+        client = NightscoutClient.from_env()
+        result["pump"] = client.pump()
+    except NightscoutConnectionError as e:
+        result["unreachable"] = True
+        result["error"] = str(e)
+    except NightscoutError as e:
+        result["error"] = str(e)
+    except Exception as e:
+        result["error"] = str(e)
+
+    _ns_state = result
+    return result
+
+
+def get_monitor_state(conn, key: str, default: str = None) -> str:
+    """Read a value from the sync_state key/value store."""
+    row = conn.execute(
+        "SELECT value FROM sync_state WHERE key = ?", (key,)
+    ).fetchone()
+    return row["value"] if row else default
+
+
+def set_monitor_state(conn, key: str, value: str):
+    """Write a value to the sync_state store (skipped in --dry-run)."""
+    if DRY_RUN:
+        return
+    conn.execute(
+        "INSERT OR REPLACE INTO sync_state (key, value, updated_at) VALUES (?, ?, ?)",
+        (key, value, utc_now().isoformat()),
+    )
+    conn.commit()
+
+
+def rule_low_reservoir(conn) -> list[dict]:
+    """Rule 7: Low reservoir — fires once on the downward crossing below
+    RESERVOIR_LOW_UNITS, then stays quiet until the reservoir goes back
+    above the threshold (pod change), rather than re-firing every poll.
+    """
+    pump = fetch_pump_state()["pump"]
+    if pump is None:
+        return []
+
+    reservoir = pump.get("reservoir")
+    exact = pump.get("reservoir_exact", True)
+    prev = get_monitor_state(conn, "monitor_reservoir_state", "above")
+
+    # Omnipod reports "50+" above 50u (reservoir_exact False) — clearly above
+    if reservoir is None or not exact or reservoir >= RESERVOIR_LOW_UNITS:
+        if prev == "below":
+            set_monitor_state(conn, "monitor_reservoir_state", "above")
+        return []
+
+    if prev == "below":
+        return []  # already alerted on this crossing
+
+    set_monitor_state(conn, "monitor_reservoir_state", "below")
+
+    msg = (
+        f"\U0001fab7 Low reservoir: {pump.get('reservoir_display', reservoir)}u left "
+        f"(threshold {RESERVOIR_LOW_UNITS:.0f}u). Plan a pod change."
+    )
+    return [{"rule": "LOW_RESERVOIR", "message": msg}]
+
+
+def _pod_age_alert(conn, rule_name: str, threshold_hours: float) -> list[dict]:
+    """Shared pod-age check. Fires once per pod (dedup on site_changed_at)."""
+    pump = fetch_pump_state()["pump"]
+    if pump is None or pump.get("pod_age_hours") is None:
+        return []
+
+    age = pump["pod_age_hours"]
+    if age < threshold_hours:
+        return []
+
+    # One alert per pod: dedup on the pod's site-change timestamp
+    dedup_key = pump.get("site_changed_at") or "unknown-pod"
+    history = get_alert_history(conn, rule_name, hours=96.0, dedup_key=dedup_key)
+    if history:
+        return []
+
+    hours_left = max(0.0, POD_HARD_STOP_HOURS - age)
+    if rule_name == "POD_AGE_URGENT":
+        msg = (
+            f"\U0001f6a8 Pod age {age:.0f}h — hard stop at {POD_HARD_STOP_HOURS}h "
+            f"(~{hours_left:.0f}h left). Change the pod now."
+        )
+    else:
+        msg = (
+            f"⏳ Pod age {age:.0f}h (≥{POD_WARN_HOURS}h). "
+            f"Hard stop at {POD_HARD_STOP_HOURS}h — plan a pod change today."
+        )
+    return [{"rule": rule_name, "message": msg, "dedup_key": dedup_key}]
+
+
+def rule_pod_age_warn(conn) -> list[dict]:
+    """Rule 8a: Pod age ≥ 72h — first warning, once per pod."""
+    return _pod_age_alert(conn, "POD_AGE_WARN", POD_WARN_HOURS)
+
+
+def rule_pod_age_urgent(conn) -> list[dict]:
+    """Rule 8b: Pod age ≥ 78h — urgent warning, once per pod.
+
+    Separate alert key from POD_AGE_WARN so both fire once each.
+    """
+    return _pod_age_alert(conn, "POD_AGE_URGENT", POD_URGENT_HOURS)
+
+
+def rule_loop_stale(conn) -> list[dict]:
+    """Rule 9: Loop-not-looping — Nightscout is reachable but devicestatus is
+    stale (loop hasn't run in > LOOP_STALE_MINUTES). Distinct from
+    NIGHTSCOUT_UNREACHABLE, which means the site itself can't be reached.
+    """
+    state = fetch_pump_state()
+    pump = state["pump"]
+    if pump is None:
+        return []
+
+    stale_min = pump.get("last_loop_minutes_ago")
+    if stale_min is None:
+        stale_min = pump.get("data_age_minutes")
+    if stale_min is None or stale_min <= LOOP_STALE_MINUTES:
+        return []
+
+    if was_recently_alerted(conn, "LOOP_STALE"):
+        return []
+
+    msg = (
+        f"\U0001f504 Loop hasn't run in {stale_min:.0f} min "
+        f"(status: {pump.get('loop_status', 'unknown')}). "
+        f"Check pump/phone connection — no automated basal adjustments meanwhile."
+    )
+    return [{"rule": "LOOP_STALE", "message": msg}]
+
+
+def rule_nightscout_unreachable(conn) -> list[dict]:
+    """Rule 10: Nightscout site unreachable (network/timeout) — different
+    failure mode (and alert key/message) from stale loop data.
+    """
+    state = fetch_pump_state()
+    if not state["unreachable"]:
+        return []
+
+    if was_recently_alerted(conn, "NIGHTSCOUT_UNREACHABLE"):
+        return []
+
+    msg = (
+        "\U0001f4e1 Nightscout unreachable — no pump/loop visibility right now. "
+        "BG monitoring continues from local readings."
+    )
+    return [{"rule": "NIGHTSCOUT_UNREACHABLE", "message": msg}]
+
+
 # ── Snooze CLI handlers ───────────────────────────────────────────
 
 def handle_snooze(conn, rule_name: str, duration_minutes: int):
@@ -991,6 +1201,9 @@ def main():
                         help="Clear all active snoozes")
     args = parser.parse_args()
 
+    global DRY_RUN
+    DRY_RUN = args.dry_run
+
     conn = get_db()
     ensure_tables(conn)
 
@@ -1021,6 +1234,12 @@ def main():
         # ("PRE_WORKOUT_LOW_RISK", rule_pre_workout_low_risk),
         ("OVERNIGHT_HIGH", rule_overnight_high),
         ("LOW_WARNING", rule_low_warning),
+        # Nightscout pump/loop rules (no-op if nightscout isn't configured)
+        ("LOW_RESERVOIR", rule_low_reservoir),
+        ("POD_AGE_WARN", rule_pod_age_warn),
+        ("POD_AGE_URGENT", rule_pod_age_urgent),
+        ("LOOP_STALE", rule_loop_stale),
+        ("NIGHTSCOUT_UNREACHABLE", rule_nightscout_unreachable),
     ]
 
     for rule_name, rule_fn in rules:
