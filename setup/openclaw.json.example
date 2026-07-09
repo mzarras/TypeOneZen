@@ -1,0 +1,113 @@
+// TypeOneZen / Zenbot — OpenClaw config template.
+//
+// Real file location (VERIFIED against https://docs.openclaw.ai as of
+// 2026-07-09): ~/.openclaw/openclaw.json
+//   cp setup/openclaw.json.example ~/.openclaw/openclaw.json
+// Then edit the placeholders below.
+//
+// Format: JSON5 (comments and unquoted-key-friendly) — OpenClaw's own docs
+// describe the config as "JSON format (with JSON5 syntax support for
+// comments)", so this file is valid to use as-is. If your OpenClaw version
+// insists on strict JSON, strip the comments and any trailing commas.
+//
+// VERIFIED vs UNVERIFIED — see setup/SETUP.md section 7 for the full
+// research trail (source URLs, what was fetched, what wasn't confirmed).
+// Every key below is either:
+//   - VERIFIED: seen directly in a fetched docs.openclaw.ai page, or
+//   - marked UNVERIFIED / best-effort inline.
+
+{
+  // VERIFIED (docs.openclaw.ai/providers/anthropic): the Anthropic API key
+  // is read from the ANTHROPIC_API_KEY env var. Recommended: export it in
+  // your shell profile (~/.zshrc) rather than hardcoding it here, then
+  // reference it with ${VAR_NAME} substitution (VERIFIED: "Reference env
+  // vars in any config string value with ${VAR_NAME}",
+  // docs.openclaw.ai/gateway/configuration).
+  "env": {
+    "ANTHROPIC_API_KEY": "${ANTHROPIC_API_KEY}"
+  },
+
+  // VERIFIED structure (docs.openclaw.ai/gateway/configuration,
+  // docs.openclaw.ai/providers/anthropic): agents.defaults.workspace and
+  // agents.defaults.model.primary, with model refs in "provider/model"
+  // form (e.g. "anthropic/claude-opus-4-8" was the example shown).
+  //
+  // The MODEL ID ITSELF — "claude-haiku-4-5" — is per this project's
+  // explicit requirement (cost: routes most questions to local scripts
+  // via tz_query.py rather than doing everything in-model). The fetched
+  // docs pages did not list a Haiku model in their examples, so confirm
+  // it's a valid/available ref before relying on it:
+  //   openclaw models list --provider anthropic
+  // If that ID isn't recognized, use the closest available Haiku alias
+  // and update this file + setup/SETUP.md accordingly.
+  "agents": {
+    "defaults": {
+      "workspace": "~/.openclaw/workspace",
+      "model": {
+        "primary": "anthropic/claude-haiku-4-5"
+      }
+    }
+  },
+
+  // VERIFIED (docs.openclaw.ai/channels/imessage) — key names, types, and
+  // behavior of dmPolicy/allowFrom/groupPolicy/groupAllowFrom confirmed
+  // directly from the iMessage channel doc page.
+  "channels": {
+    "imessage": {
+      "enabled": true,
+
+      // VERIFIED default path on Apple Silicon Homebrew installs; adjust
+      // if `which imsg` differs on your Mac.
+      "cliPath": "/opt/homebrew/bin/imsg",
+
+      // VERIFIED key; replace YOUR_MAC_USERNAME with your actual macOS
+      // short username (the account signed into iMessage as Zenbot).
+      "dbPath": "/Users/YOUR_MAC_USERNAME/Library/Messages/chat.db",
+
+      // VERIFIED values: "pairing" | "allowlist" | "open" | "disabled".
+      // "allowlist" is recommended here — it's the only mode that doesn't
+      // require an interactive `openclaw pairing approve` round-trip
+      // before Zenbot will answer your first DM, and this is a
+      // single-user personal assistant (you), not a shared bot.
+      "dmPolicy": "allowlist",
+
+      // Real phone number(s) allowed to DM Zenbot, E.164 format.
+      // Placeholder — replace before first use, never commit the real one.
+      "allowFrom": ["+1XXXXXXXXXX"],
+
+      // No group chats for this use case — lock it down.
+      "groupPolicy": "disabled",
+      "groupAllowFrom": [],
+
+      // VERIFIED keys; lets Zenbot receive meal/pump-screenshot photos.
+      "includeAttachments": true,
+      "mediaMaxMb": 16
+    }
+  }
+
+  // ── NOT INCLUDED: heartbeat / proactive messaging ──────────────────────
+  // The task brief asked for a heartbeat/proactive config "only if the
+  // real docs support it." What was found (docs.openclaw.ai/gateway/
+  // configuration-reference) was a top-level "cron" section, a "hooks"
+  // section, and a "commitments.enabled" flag described only as
+  // "inferred follow-up delivery via heartbeat" — no concrete key/value
+  // schema was shown on the pages that were reachable, so nothing
+  // invented here.
+  //
+  // It's also not needed for this deployment: TypeOneZen already does
+  // its own proactive push via macOS cron + monitor.py / daily_summary.py
+  // sending iMessages directly (see setup/crontab.txt) — Zenbot itself
+  // only needs to answer when messaged, not initiate on a schedule.
+  //
+  // ── NOT INCLUDED: nativeSkills ──────────────────────────────────────────
+  // TypeOneZen's own README says to set `nativeSkills: "auto"` (its
+  // stated default). That key was NOT found anywhere in the
+  // docs.openclaw.ai pages fetched for this task — instead, skill
+  // discovery is documented as fully automatic: any
+  // <workspace>/skills/<name>/SKILL.md is picked up with no config
+  // registration required (VERIFIED: docs.openclaw.ai/tools/skills).
+  // So no key is needed here either way — setup/install_skills.sh just
+  // drops the skill files in place. If your OpenClaw version turns out
+  // to require nativeSkills explicitly, add: "nativeSkills": "auto"
+  // at the top level and flag that docs.openclaw.ai is out of date.
+}

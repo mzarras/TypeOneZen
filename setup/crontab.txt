@@ -1,0 +1,78 @@
+# TypeOneZen — crontab for the MacBook Air deployment.
+#
+# INSTALL:
+#   This REPLACES your entire user crontab:
+#     crontab /Users/YOUR_MAC_USERNAME/TypeOneZen/setup/crontab.txt
+#   (crontab with a file argument overwrites, it does not merge.)
+#
+#   To MERGE with an existing crontab instead (e.g. you already have other
+#   cron jobs on this Mac), do it manually:
+#     crontab -l > /tmp/existing_crontab   # back up what's there now
+#     cat /tmp/existing_crontab setup/crontab.txt > /tmp/merged_crontab
+#     crontab -e                            # paste in /tmp/merged_crontab, save
+#
+#   Verify what's installed:
+#     crontab -l
+#
+# PATH: cron runs jobs with a minimal environment (no ~/.zshrc, no Homebrew
+# shims by default). Set PATH explicitly so python3 (Homebrew on Apple
+# Silicon lives at /opt/homebrew/bin) and imsg are found.
+PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
+
+# Poll Dexcom Share every 5 minutes (redundant BG source alongside Nightscout)
+*/5 * * * * cd ~/TypeOneZen && python3 poller.py >> logs/cron.log 2>&1
+
+# Sync Nightscout (CGM entries, boluses/SMBs, temp basals, pump-logged carbs) every 5 minutes
+*/5 * * * * cd ~/TypeOneZen && python3 ns_sync.py >> logs/cron.log 2>&1
+
+# Run BG + pump alert monitor every 5 minutes (sends iMessage alerts)
+*/5 * * * * cd ~/TypeOneZen && python3 monitor.py >> logs/monitor.log 2>&1
+
+# Regenerate cached health summary daily at 3am (summaries/health_context.md + stats_cache.json)
+0 3 * * * cd ~/TypeOneZen && python3 parsers/refresh_summary.py >> logs/cron.log 2>&1
+
+# Fetch new COROS workouts every 6 hours and import as FIT files
+0 */6 * * * cd ~/TypeOneZen && python3 parsers/fetch_coros.py --days 3 >> logs/cron.log 2>&1
+
+# Morning daily summary (iMessage) at 8am
+0 8 * * * cd ~/TypeOneZen && python3 scripts/daily_summary.py --period morning >> logs/cron.log 2>&1
+
+# Evening daily summary (iMessage, includes overnight risk flag) at 9pm
+0 21 * * * cd ~/TypeOneZen && python3 scripts/daily_summary.py --period evening >> logs/cron.log 2>&1
+
+# Nightly memory file for the OpenClaw agent (~/.openclaw/workspace/memory/YYYY-MM-DD.md) at 10:30pm
+# (schedule per the docstring in scripts/write_daily_memory.py itself)
+30 22 * * * cd ~/TypeOneZen && python3 scripts/write_daily_memory.py >> logs/cron.log 2>&1
+
+# ─────────────────────────────────────────────────────────────────────────
+# NOTE on cadence discrepancy found during setup-kit research: README.md /
+# CLAUDE.md say monitor.py runs every 5 minutes (used above); the OpenClaw
+# skill's SKILL.md "Operational Context" section says "runs every 15 min
+# via cron" instead. This crontab uses 5 minutes per README.md/CLAUDE.md
+# and this task's own instructions. If you'd rather match SKILL.md, change
+# the monitor.py line above to "*/15 * * * *" AND update SKILL.md to match
+# — pick one and make both agree.
+# ─────────────────────────────────────────────────────────────────────────
+
+# ─────────────────────────────────────────────────────────────────────────
+# KEEPING THE LID CLOSED WITHOUT SLEEPING
+#
+# Closing a MacBook's lid puts it to sleep regardless of pmset idle-sleep
+# settings UNLESS something overrides that specific "clamshell sleep"
+# trigger — pmset's "sleep 0" alone does NOT do this, it only disables
+# idle-timeout sleep while the lid is open.
+#
+# Recommended (Air stays plugged into power, lid closed, headless):
+#   1. System Settings > Battery > Options (or "Power Adapter" on some
+#      macOS versions) > enable "Prevent automatic sleeping when the
+#      display is off" if your macOS version offers it.
+#   2. In Terminal, run BOTH of the following (require sudo, ask for the
+#      Mac's admin password):
+#        sudo pmset -a disablesleep 1        # overrides lid-closed sleep
+#        sudo pmset -a sleep 0 displaysleep 5 # no idle sleep; display off after 5 min
+#      verify: pmset -g | grep -E "sleep|disablesleep"
+#      (expect: "sleep      0", "disablesleep    1")
+#   3. Keep the Air on AC power at all times — battery-only clamshell
+#      operation is unreliable even with disablesleep set.
+#   4. To temporarily undo: sudo pmset -a disablesleep 0
+# ─────────────────────────────────────────────────────────────────────────

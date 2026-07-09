@@ -32,6 +32,7 @@ python3 -m pytest tests/
 # Import data
 python3 parsers/parse_glooko.py   # import Glooko CSVs from data/imports/glooko/ (historical backfill; ns_sync.py covers ongoing data)
 python3 parsers/parse_fit.py      # import Garmin FIT files from data/imports/fit/
+python3 parsers/parse_correlatewell.py  # import CorrelateWell CSVs from data/imports/correlatewell/ (--dry-run supported)
 
 # Generate health summary report
 python3 parsers/generate_summary.py        # outputs to summaries/
@@ -55,6 +56,7 @@ python3 parsers/backfill_meals_from_bolus.py   # extract meals from bolus notes
 
 **Parsers (`parsers/`):**
 - `parse_glooko.py` — Imports CGM, BG, bolus, and basal data from Glooko CSV exports. Converts local NY time to UTC
+- `parse_correlatewell.py` — Imports glucose + workout CSVs exported from CorrelateWell (the author's separate health app); minute-granularity cross-source dedup, idempotent re-runs. Its companion exporter (`export_correlatewell.py`) is deliberately gitignored — personal tooling, never committed
 - `parse_fit.py` — Imports Garmin FIT workout files with activity type mapping and intensity derivation from heart rate
 - `generate_summary.py` — Produces `summaries/health_context.md` and `summaries/stats_cache.json` with BG statistics, time-in-range, insulin totals, workout/meal-BG correlations, and auto-generated insights
 - `backfill_meals_from_bolus.py` — Extracts meal data from bolus insulin notes
@@ -72,3 +74,5 @@ python3 parsers/backfill_meals_from_bolus.py   # extract meals from bolus notes
 - BG range thresholds: low < 70 mg/dL, high > 180 mg/dL
 - Closed-loop context: SMBs arrive from Nightscout as many small boluses stored as `type='bolus'` — aggregate them in summaries, don't treat them as anomalies
 - Tests live in `tests/` (pytest). They use a temp SQLite db and a stub `nightscout_client` installed in `sys.modules` by `tests/conftest.py` — never the real package or the sibling checkout
+- The OpenClaw skill scripts (`examples/openclaw-skill/scripts/`) and `scripts/log_omnipod_screenshot.py` resolve the data directory via `$TZ_HOME` (default `~/TypeOneZen`); core cron scripts still assume the repo lives at `~/TypeOneZen`
+- `setup/SETUP.md` is the full new-machine deployment runbook (written to be executed by a Claude Code session on the target Mac)
