@@ -134,6 +134,20 @@ def init_db() -> None:
         )
     """)
 
+    # Owned by monitor.py (see monitor.ensure_tables, which is a superset and
+    # safe to re-run) — created here too so a fresh init_db() can build the
+    # alert_log index below without monitor.py having run first.
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS alert_log (
+            id          INTEGER PRIMARY KEY AUTOINCREMENT,
+            rule_name   TEXT NOT NULL,
+            triggered_at TEXT NOT NULL,
+            message     TEXT NOT NULL,
+            sent        INTEGER DEFAULT 0,
+            dedup_key   TEXT
+        )
+    """)
+
     # -- Indexes for time-range queries --
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_glucose_timestamp ON glucose_readings(timestamp)")
     cursor.execute("CREATE INDEX IF NOT EXISTS idx_insulin_timestamp ON insulin_doses(timestamp)")

@@ -180,6 +180,12 @@ python3 ns_sync.py --since 2026-01-01   # backfill from a date, re-run safe
 # data. Place files in data/imports/glooko/)
 python3 parsers/parse_glooko.py
 
+# Import CorrelateWell CSV exports (glucose + workouts; place glucose.csv /
+# workouts.csv in data/imports/correlatewell/). Dedups against all sources
+# at minute granularity; safe to re-run.
+python3 parsers/parse_correlatewell.py --dry-run
+python3 parsers/parse_correlatewell.py
+
 # Import Garmin FIT workout files (place files in data/imports/fit/)
 python3 parsers/parse_fit.py
 
@@ -313,7 +319,18 @@ tz_query.py meals 24       # Recent meals with macros
 tz_query.py workouts 7     # Recent workouts with pre/during/post BG averages
 tz_query.py summary        # Cached health summary (no recomputation)
 tz_query.py monitor        # Dry-run BG alert rules
+tz_query.py day [date]     # Full-day recap: BG stats, insulin, carbs, meals, workouts, alerts
+tz_query.py overnight      # Last 11pm-7am window: stats + any lows
+tz_query.py week           # Last 7 days vs prior 7 (TIR, avg, CV, insulin/day)
+tz_query.py last-bolus     # Most recent bolus + today's total
+tz_query.py last-meal      # Most recent meal
+tz_query.py alerts 24      # Alerts fired in the last N hours
+tz_query.py bg-at "3am"    # Glucose reading nearest a time expression
+tz_query.py a1c 90         # GMI (estimated A1C) over N days
+tz_query.py carbs 24       # Carb totals over N hours
 ```
+
+Scripts locate the data directory via `$TZ_HOME` (default `~/TypeOneZen`).
 
 **Write operations** (`tz_log.py`):
 
@@ -341,9 +358,16 @@ TypeOneZen/
   requirements.txt
   .env.example           # Credential template
   tests/                 # pytest suite (ns_sync idempotency, monitor pump rules)
+  setup/
+    SETUP.md             # Full new-machine deployment runbook (fresh Mac -> running Zenbot)
+    install.sh           # Idempotent dependency/dir bootstrap
+    crontab.txt          # Complete cron schedule template
+    openclaw.json.example # OpenClaw agent config template
+    install_skills.sh    # Copies skills into the OpenClaw workspace
   parsers/
     parse_glooko.py      # Glooko CSV import
     parse_fit.py         # Garmin FIT import
+    parse_correlatewell.py # CorrelateWell CSV import (glucose + workouts backfill)
     generate_summary.py  # Health summary report generator
     refresh_summary.py   # Silent cron wrapper for summary generation
     backfill_meals_from_bolus.py  # Extract meals from bolus notes

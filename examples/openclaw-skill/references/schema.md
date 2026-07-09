@@ -82,6 +82,17 @@
 | value | TEXT NOT NULL | Sync cursor (ISO timestamp) or monitor state value |
 | updated_at | TEXT | Auto-set |
 
+### alert_snoozes
+| Column | Type | Notes |
+|--------|------|-------|
+| id | INTEGER PK | Auto-increment |
+| rule_name | TEXT NOT NULL | Matches `alert_log.rule_name`, or 'ALL' |
+| snoozed_at | TEXT NOT NULL | ISO8601 UTC |
+| expires_at | TEXT NOT NULL | ISO8601 UTC — snooze is active until this time |
+| reason | TEXT | Optional free text |
+
+Created by `monitor.py --snooze RULE_NAME`. A snoozed rule is suppressed until `expires_at`.
+
 ## Indexes
 
 ```

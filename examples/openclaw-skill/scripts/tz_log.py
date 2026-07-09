@@ -3,12 +3,14 @@
 
 import argparse
 import json
+import os
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
-DB_PATH = Path.home() / "TypeOneZen" / "data" / "TypeOneZen.db"
+TZ_HOME = Path(os.environ.get("TZ_HOME", Path.home() / "TypeOneZen"))
+DB_PATH = TZ_HOME / "data" / "TypeOneZen.db"
 UTC = ZoneInfo("UTC")
 NY = ZoneInfo("America/New_York")
 
