@@ -513,6 +513,29 @@ Expect a version string.
 
 ### 7.2 Onboard
 
+Two ways to pay for the model — pick one:
+
+**Option A — Claude subscription (Max plan), preferred if available.** As of
+mid-2026 Anthropic allows third-party Agent-SDK-based harnesses like OpenClaw
+to draw from a Pro/Max subscription's normal usage limits (policy history:
+cut off 2026-04-04, reinstated via "Agent SDK credits" 2026-05-14, and the
+planned separate-credit split was paused 2026-06-15 — usage draws from the
+regular subscription limits again). This shares limits with interactive
+Claude Code use on the same account, and the policy has changed twice in
+three months — so verify current behavior, and keep Option B configured as
+fallback:
+
+```bash
+openclaw onboard --install-daemon
+openclaw models auth login --provider anthropic --method cli   # subscription OAuth
+# (or: openclaw models auth setup-token --provider anthropic)
+openclaw gateway restart
+```
+
+**Option B — API key (predictable, pay-per-token).** Haiku 4.5 at $1/$5 per
+MTok; with the script-routing skill design a typical month should be a few
+dollars:
+
 ```bash
 openclaw onboard --install-daemon --anthropic-api-key "$ANTHROPIC_API_KEY"
 ```
