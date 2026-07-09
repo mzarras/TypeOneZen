@@ -16,24 +16,15 @@ not in any repo).
 ## Known Issues Found While Building This Kit
 
 Read this before starting — it'll save time later. These were confirmed
-by directly reading/running the code in this repo (branch
-`nightscout-integration`), not assumed:
+by directly reading/running the code in this repo (now merged to `main`),
+not assumed:
 
-1. **`python3 db.py` crashes on a truly-fresh machine.** `db.py`'s
-   `init_db()` creates an index on the `alert_log` table
-   (`idx_alert_log_rule_time`), but `alert_log` itself is only ever
-   `CREATE TABLE`'d inside `monitor.py`'s `ensure_tables()` — never inside
-   `db.py`. Confirmed by running `db.py` against a fresh `$HOME`: it
-   creates `glucose_readings`, `insulin_doses`, `workouts`, `meals`,
-   `notes`, then raises `sqlite3.OperationalError: no such table:
-   main.alert_log` and exits non-zero — **before** it reaches the
-   `ensure_sync_schema()` call, so `sync_state` doesn't get created
-   either. Section 4 below documents the two-command workaround
-   (`python3 db.py` then `python3 monitor.py --dry-run`, which creates
-   `alert_log`, `alert_snoozes`, and `sync_state` via its own
-   `ensure_tables()`). This is an existing bug in the repo, not something
-   this kit patches — `setup/` only adds new files, per this task's
-   constraints.
+1. **[FIXED — kept for history]** `python3 db.py` used to crash on a
+   truly-fresh machine (it created an index on `alert_log` before any
+   code had created that table). `db.py` now creates `alert_log` itself,
+   so a fresh `init_db()` succeeds and builds 7 of the 8 tables;
+   `alert_snoozes` still comes from `monitor.py`'s `ensure_tables()` —
+   section 4 runs `monitor.py --dry-run` right after `db.py` to add it.
 2. **`parsers/export_correlatewell.py` is deliberately gitignored** — per
    its own docstring, it's personal tooling that connects directly to the
    CorrelateWell production Postgres instance, and per `.gitignore`
@@ -61,12 +52,10 @@ by directly reading/running the code in this repo (branch
    else reading/writing the real `~/TypeOneZen/data/TypeOneZen.db`.
    `setup/install.sh` warns (but doesn't block) if it detects the repo
    isn't at `~/TypeOneZen`.
-4. **Monitor cron cadence is documented inconsistently within this repo
-   itself.** `README.md` and `CLAUDE.md` say `monitor.py` runs every 5
-   minutes; the OpenClaw skill's `SKILL.md` "Operational Context" section
-   says "runs every 15 min via cron." `setup/crontab.txt` uses 5 minutes
-   (matching README/CLAUDE.md). Worth reconciling those two docs at some
-   point, but out of scope for this kit (`SKILL.md` is an existing file).
+4. **[RESOLVED]** Monitor cron cadence was documented inconsistently
+   (an older `SKILL.md` said 15 min). `SKILL.md` has since been rewritten
+   with no cadence claim; `setup/crontab.txt` uses 5 minutes, matching
+   `README.md` and `CLAUDE.md`.
 5. **OpenClaw's `nativeSkills` config key** (referenced in this repo's own
    `README.md`) could not be found anywhere in the current
    `docs.openclaw.ai` pages fetched for this task. See Section 7 for the
@@ -197,13 +186,13 @@ Expect `set (NN chars)`, not empty.
 cd ~
 git clone https://github.com/mzarras/TypeOneZen.git ~/TypeOneZen
 cd ~/TypeOneZen
-git checkout nightscout-integration
 ```
 **Verify:**
 ```bash
 pwd && git branch --show-current
 ```
-Expect `/Users/YOUR_MAC_USERNAME/TypeOneZen` and `nightscout-integration`.
+Expect `/Users/YOUR_MAC_USERNAME/TypeOneZen` and `main` (everything is
+merged to `main`; no branch checkout needed).
 
 Clone `nightscout-client` as a sibling checkout (gives you an editable
 install for `nscli` + makes `setup/install_skills.sh` able to find the
@@ -284,23 +273,18 @@ cd ~/TypeOneZen
 python3 db.py
 ```
 
-**This will print a traceback and exit non-zero** — see "Known Issues" #1
-above. Expected output ends with:
-```
-sqlite3.OperationalError: no such table: main.alert_log
-```
-That's fine — `glucose_readings`, `insulin_doses`, `workouts`, `meals`,
-and `notes` were created before the crash. Immediately run:
+Expect `Database initialized.` (the historical fresh-machine crash is
+fixed — see "Known Issues" #1). This creates 7 of the 8 tables. Then run:
 
 ```bash
 python3 monitor.py --dry-run
 ```
 
-This creates the remaining tables (`alert_log`, `alert_snoozes`,
-`sync_state`) via its own `ensure_tables()`, which runs before any
-network/iMessage calls — safe to run even before Nightscout/Dexcom are
-fully verified. It'll likely print "no data" style output for the actual
-rules; that's expected on an empty DB.
+This adds the last table (`alert_snoozes`) via monitor's own
+`ensure_tables()`, which runs before any network/iMessage calls — safe
+to run even before Nightscout/Dexcom are fully verified. It'll likely
+print "no data" style output for the actual rules; that's expected on an
+empty DB.
 
 **Verify:**
 ```bash
