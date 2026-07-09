@@ -13,7 +13,8 @@
 | glucose_mg_dl | INTEGER NOT NULL | BG value in mg/dL |
 | trend | TEXT | e.g. Flat, FortyFiveUp, SingleUp |
 | trend_arrow | TEXT | e.g. →, ↗, ↑ |
-| source | TEXT | Default 'dexcom' |
+| source | TEXT | 'dexcom' (default), 'glooko', 'nightscout' |
+| source_id | TEXT | External record ID (Nightscout); unique where not null |
 | created_at | TEXT | Auto-set |
 
 ### insulin_doses
@@ -22,8 +23,9 @@
 | id | INTEGER PK | Auto-increment |
 | timestamp | TEXT NOT NULL | ISO8601 UTC |
 | units | REAL NOT NULL | Dose amount |
-| type | TEXT | bolus, basal, correction |
+| type | TEXT | bolus, basal, correction (SMBs from the loop are stored as boluses) |
 | notes | TEXT | May contain meal context |
+| source_id | TEXT | Nightscout `_id` for synced doses; unique where not null |
 | created_at | TEXT | Auto-set |
 
 ### meals
@@ -38,8 +40,9 @@
 | fiber_g | REAL | Fiber blunts BG impact |
 | calories | INTEGER | |
 | glycemic_load | REAL | Optional |
-| source | TEXT | 'manual', 'photo', 'message' |
+| source | TEXT | 'manual', 'photo', 'message', 'nightscout' |
 | notes | TEXT | Extra context |
+| source_id | TEXT | Nightscout `_id` for synced carb entries; unique where not null |
 | created_at | TEXT | Auto-set |
 
 ### workouts
@@ -66,10 +69,29 @@
 | Column | Type | Notes |
 |--------|------|-------|
 | id | INTEGER PK | Auto-increment |
-| rule_name | TEXT NOT NULL | POST_MEAL_SPIKE, SUSTAINED_HIGH, etc. |
+| rule_name | TEXT NOT NULL | POST_MEAL_SPIKE, SUSTAINED_HIGH, LOW_RESERVOIR, POD_AGE_WARN, etc. |
 | triggered_at | TEXT NOT NULL | ISO8601 UTC |
 | message | TEXT NOT NULL | Alert message sent |
 | sent | INTEGER | 1 = sent, 0 = failed |
+| dedup_key | TEXT | Per-episode dedup (e.g. meal timestamp, pod site_changed_at) |
+
+### sync_state
+| Column | Type | Notes |
+|--------|------|-------|
+| key | TEXT PK | e.g. 'nightscout_entries', 'nightscout_treatments', 'monitor_reservoir_state' |
+| value | TEXT NOT NULL | Sync cursor (ISO timestamp) or monitor state value |
+| updated_at | TEXT | Auto-set |
+
+### alert_snoozes
+| Column | Type | Notes |
+|--------|------|-------|
+| id | INTEGER PK | Auto-increment |
+| rule_name | TEXT NOT NULL | Matches `alert_log.rule_name`, or 'ALL' |
+| snoozed_at | TEXT NOT NULL | ISO8601 UTC |
+| expires_at | TEXT NOT NULL | ISO8601 UTC — snooze is active until this time |
+| reason | TEXT | Optional free text |
+
+Created by `monitor.py --snooze RULE_NAME`. A snoozed rule is suppressed until `expires_at`.
 
 ## Indexes
 
@@ -79,6 +101,9 @@ idx_insulin_timestamp     → insulin_doses(timestamp)
 idx_meals_timestamp       → meals(timestamp)
 idx_workouts_started      → workouts(started_at)
 idx_alert_log_rule_time   → alert_log(rule_name, triggered_at)
+idx_glucose_source_id     → glucose_readings(source_id) UNIQUE where not null
+idx_insulin_source_id     → insulin_doses(source_id) UNIQUE where not null
+idx_meals_source_id       → meals(source_id) UNIQUE where not null
 ```
 
 ## Common Query Patterns

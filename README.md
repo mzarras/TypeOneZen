@@ -1,6 +1,6 @@
 # TypeOneZen
 
-A self-hosted Type 1 Diabetes data collection and monitoring system. Polls a Dexcom G7 CGM via the Dexcom Share API, stores glucose readings in SQLite, imports insulin and workout data from Glooko and Garmin, runs rule-based BG alerts via iMessage, and generates health summary reports.
+A self-hosted Type 1 Diabetes data collection and monitoring system. Syncs CGM readings, insulin doses, and pump/loop status from Nightscout (Trio + Omnipod 5 closed loop), polls a Dexcom G7 CGM via the Dexcom Share API as a redundant source, stores everything in SQLite, imports workout data from Garmin, runs rule-based BG and pump alerts via iMessage, and generates health summary reports.
 
 Built for personal use by a T1D runner who wanted a single place to correlate glucose, insulin, and workout data — the full picture that no single app provides.
 
@@ -8,9 +8,11 @@ Designed to work with [OpenClaw](https://github.com/openclaw/openclaw) — an al
 
 ## Features
 
-- **Live CGM polling** — Fetches Dexcom G7 readings every 5 minutes via the Share API
+- **Nightscout sync** — Pulls CGM entries, boluses/SMBs, temp basals, and pump-logged carbs from a Nightscout site every 5 minutes (closed-loop aware: Trio + Omnipod 5)
+- **Live CGM polling** — Fetches Dexcom G7 readings every 5 minutes via the Share API (kept as a redundant BG source)
 - **Rule-based BG alerts** — Post-meal spikes, sustained highs, rapid drops, overnight highs — sent via iMessage with 2-hour dedup
-- **Multi-source data import** — Glooko CSV exports (insulin + BG), Garmin FIT files (workouts with HR zones)
+- **Pump alerts** — Low reservoir, pod age (80h hard stop), loop-not-looping — from live Nightscout pump state
+- **Multi-source data import** — Glooko CSV exports (insulin + BG — backfill for history predating Nightscout), Garmin FIT files (workouts with HR zones)
 - **Health summaries** — Auto-generated reports with time-in-range, insulin totals, workout-BG correlations, and pattern insights
 - **Meal logging** — Track meals with macros (carbs, protein, fat, fiber, calories)
 - **SQLite storage** — Everything in one local database, indexed for fast time-range queries
@@ -64,19 +66,19 @@ No app to install. No dashboard to check. No login to remember. The data comes t
 ## Architecture
 
 ```
-Dexcom G7 CGM
-      |
-      v
-  poller.py ──────> SQLite DB <────── parse_glooko.py (Glooko CSV)
-  (every 5 min)        |       <────── parse_fit.py (Garmin FIT)
-                        |
-              ┌─────────┼──────────┐
-              v         v          v
-         monitor.py  generate_    tz_query.py
-         (alerts)    summary.py   (ad-hoc queries)
-              |         |
-              v         v
-          iMessage   summaries/
+Dexcom G7 CGM        Nightscout (Trio + Omnipod 5)
+      |                     |
+      v                     v
+  poller.py            ns_sync.py ──> SQLite DB <── parse_fit.py (Garmin FIT)
+  (every 5 min)        (every 5 min)      |      <── parse_glooko.py (historical CSV)
+                            |             |
+                            |   ┌─────────┼──────────┐
+                            |   v         v          v
+                            └> monitor.py  generate_  tz_query.py
+                               (alerts)   summary.py  (queries + live pump)
+                                  |          |
+                                  v          v
+                              iMessage    summaries/
 ```
 
 No web server, no framework — just Python scripts run directly or via cron on macOS.
@@ -95,7 +97,7 @@ pip3 install -r requirements.txt
 cp .env.example .env
 ```
 
-Edit `.env` with your Dexcom Share username and password. Set `DEXCOM_OUTSIDE_US=true` if using the international Dexcom server.
+Edit `.env` with your Dexcom Share username and password. Set `DEXCOM_OUTSIDE_US=true` if using the international Dexcom server. For the Nightscout sync, set `NIGHTSCOUT_URL` and `NIGHTSCOUT_TOKEN` (a dedicated **read-only** access token — e.g. a `zenbot-read` subject with the `readable` role — never your API secret).
 
 ### 3. Initialize the database
 
@@ -122,12 +124,27 @@ Reading stored: 120 mg/dL -> at 2025-11-21T14:30:00
 # Poll Dexcom every 5 minutes
 */5 * * * * cd ~/TypeOneZen && python3 poller.py >> logs/cron.log 2>&1
 
+# Sync Nightscout (entries + treatments) every 5 minutes
+*/5 * * * * cd ~/TypeOneZen && python3 ns_sync.py >> logs/cron.log 2>&1
+
 # Run BG monitor every 5 minutes
 */5 * * * * cd ~/TypeOneZen && python3 monitor.py >> logs/monitor.log 2>&1
 
 # Regenerate health summary daily at 3am
 0 3 * * * cd ~/TypeOneZen && python3 parsers/refresh_summary.py >> logs/cron.log 2>&1
 ```
+
+## Nightscout Integration
+
+TypeOneZen syncs from [Nightscout](https://nightscout.github.io/) via the [`nightscout-client`](https://github.com/mzarras/nightscout-client) package (PyPI name `nightscout-client`, import `nightscout_client`). Until the PyPI release is published, install it with `pip3 install -e ../nightscout-client` from a sibling checkout, or `pip3 install git+https://github.com/mzarras/nightscout-client.git`.
+
+With a Trio + Omnipod 5 closed loop reporting to Nightscout, the integration adds:
+
+- **`ns_sync.py` (cron, every 5 min)** — CGM entries → `glucose_readings` (source `nightscout`), boluses → `insulin_doses` (SMBs arrive as many small boluses — expected; summaries aggregate them), temp basals → `insulin_doses` (`type='basal'`), pump-logged carbs → `meals`. Idempotent: synced rows store the Nightscout record ID in a unique-indexed `source_id` column, and per-stream cursors live in the `sync_state` table. Backfill with `python3 ns_sync.py --since YYYY-MM-DD` (safe to re-run).
+- **Live pump/loop context** — `tz_query.py now` gains a `nightscout` block (IOB, COB, loop status, reservoir, pod age, data age) and a new `tz_query.py pump` command exposes full pump status. Both degrade gracefully when Nightscout is unreachable — history queries stay SQLite-only.
+- **Pump alert rules in `monitor.py`** — low reservoir (fires once on the downward crossing below 20u, resets after a pod change), pod age (72h warning + 78h urgent — pods hard-stop at 80h), loop-not-looping (devicestatus stale > 30 min), and a distinct Nightscout-unreachable alert so a dead site is never confused with a stalled loop.
+
+**Ongoing insulin and CGM data now arrive automatically** instead of via manual exports. `parsers/parse_glooko.py` remains the backfill path for history that predates the Nightscout site — a fresh Nightscout deployment starts empty, while Glooko exports hold years of history (import Glooko first, then `ns_sync.py --since` from the Nightscout go-live date to avoid overlap). **`poller.py` (Dexcom Share) stays in the crontab as a redundant BG source**; the sync deduplicates cross-source readings at minute granularity so the two never double-count.
 
 ## Usage
 
@@ -146,12 +163,28 @@ python3 monitor.py --dry-run  # Print what would alert, without sending
 | Rapid drop | BG drops >30 mg/dL in 30 min |
 | Overnight high | BG >160 for >60 min between 11pm-7am |
 | Pre-workout low risk | BG <120 near typical workout time (manual trigger only) |
+| Low reservoir | Reservoir crosses below 20u (fires once per crossing, resets after pod change) |
+| Pod age warning | Pod ≥ 72h old (once per pod) |
+| Pod age urgent | Pod ≥ 78h old — hard stop at 80h (once per pod, separate alert) |
+| Loop stale | Nightscout devicestatus older than 30 min ("loop hasn't run in X min") |
+| Nightscout unreachable | Site can't be reached (network/timeout) — distinct from a stale loop |
 
 ### Data Import
 
 ```bash
-# Import Glooko CSV exports (place files in data/imports/glooko/)
+# Sync from Nightscout (normally runs every 5 min via cron)
+python3 ns_sync.py
+python3 ns_sync.py --since 2026-01-01   # backfill from a date, re-run safe
+
+# Import Glooko CSV exports (historical backfill — ns_sync.py covers ongoing
+# data. Place files in data/imports/glooko/)
 python3 parsers/parse_glooko.py
+
+# Import CorrelateWell CSV exports (glucose + workouts; place glucose.csv /
+# workouts.csv in data/imports/correlatewell/). Dedups against all sources
+# at minute granularity; safe to re-run.
+python3 parsers/parse_correlatewell.py --dry-run
+python3 parsers/parse_correlatewell.py
 
 # Import Garmin FIT workout files (place files in data/imports/fit/)
 python3 parsers/parse_fit.py
@@ -174,12 +207,15 @@ SQLite database at `data/TypeOneZen.db`. All timestamps stored as ISO8601 UTC.
 
 | Table | Description |
 |-------|-------------|
-| `glucose_readings` | CGM readings — timestamp, glucose_mg_dl, trend, trend_arrow, source |
-| `insulin_doses` | Bolus, basal, and correction doses — timestamp, units, type, notes |
-| `meals` | Meals with macros — description, carbs_g, protein_g, fat_g, fiber_g, calories |
+| `glucose_readings` | CGM readings — timestamp, glucose_mg_dl, trend, trend_arrow, source, source_id |
+| `insulin_doses` | Bolus, basal, and correction doses — timestamp, units, type, notes, source_id |
+| `meals` | Meals with macros — description, carbs_g, protein_g, fat_g, fiber_g, calories, source_id |
 | `workouts` | Garmin workouts — started_at, ended_at, activity_type, intensity |
 | `notes` | Free-text notes with tags |
 | `alert_log` | Fired alert history — rule_name, triggered_at, message, sent status |
+| `sync_state` | Key/value store — Nightscout sync cursors + monitor state transitions |
+
+Rows synced from Nightscout carry the Nightscout record ID in `source_id` (unique-indexed where not null), which is what makes `ns_sync.py` idempotent.
 
 ## OpenClaw Integration
 
@@ -275,14 +311,26 @@ Zenbot pulls from `glucose_readings`, `insulin_doses`, `meals`, and `workouts` t
 **Read queries** (`tz_query.py`) — all return compact JSON:
 
 ```bash
-tz_query.py now            # Current BG + trend + minutes since last reading
+tz_query.py now            # Current BG + trend + live pump context (IOB, COB, loop, reservoir)
+tz_query.py pump           # Live pump status from Nightscout (reservoir, pod age, loop)
 tz_query.py range 24       # BG stats over last N hours (avg, min, max, TIR)
 tz_query.py insulin 24     # Insulin doses over last N hours (by type, totals)
 tz_query.py meals 24       # Recent meals with macros
 tz_query.py workouts 7     # Recent workouts with pre/during/post BG averages
 tz_query.py summary        # Cached health summary (no recomputation)
 tz_query.py monitor        # Dry-run BG alert rules
+tz_query.py day [date]     # Full-day recap: BG stats, insulin, carbs, meals, workouts, alerts
+tz_query.py overnight      # Last 11pm-7am window: stats + any lows
+tz_query.py week           # Last 7 days vs prior 7 (TIR, avg, CV, insulin/day)
+tz_query.py last-bolus     # Most recent bolus + today's total
+tz_query.py last-meal      # Most recent meal
+tz_query.py alerts 24      # Alerts fired in the last N hours
+tz_query.py bg-at "3am"    # Glucose reading nearest a time expression
+tz_query.py a1c 90         # GMI (estimated A1C) over N days
+tz_query.py carbs 24       # Carb totals over N hours
 ```
+
+Scripts locate the data directory via `$TZ_HOME` (default `~/TypeOneZen`).
 
 **Write operations** (`tz_log.py`):
 
@@ -302,14 +350,24 @@ The `SKILL.md` file controls when the skill triggers and how your agent responds
 ```
 TypeOneZen/
   db.py                  # Schema definition, get_db() helper, table + index creation
-  poller.py              # Dexcom Share API poller
-  monitor.py             # Rule-based BG alerting via iMessage
+  poller.py              # Dexcom Share API poller (redundant BG source)
+  ns_sync.py             # Nightscout sync — entries + treatments into SQLite
+  monitor.py             # Rule-based BG + pump alerting via iMessage
   run_poller.sh          # Cron wrapper script
+  run_ns_sync.sh         # Cron wrapper for the Nightscout sync
   requirements.txt
   .env.example           # Credential template
+  tests/                 # pytest suite (ns_sync idempotency, monitor pump rules)
+  setup/
+    SETUP.md             # Full new-machine deployment runbook (fresh Mac -> running Zenbot)
+    install.sh           # Idempotent dependency/dir bootstrap
+    crontab.txt          # Complete cron schedule template
+    openclaw.json.example # OpenClaw agent config template
+    install_skills.sh    # Copies skills into the OpenClaw workspace
   parsers/
     parse_glooko.py      # Glooko CSV import
     parse_fit.py         # Garmin FIT import
+    parse_correlatewell.py # CorrelateWell CSV import (glucose + workouts backfill)
     generate_summary.py  # Health summary report generator
     refresh_summary.py   # Silent cron wrapper for summary generation
     backfill_meals_from_bolus.py  # Extract meals from bolus notes
@@ -328,12 +386,22 @@ TypeOneZen/
   summaries/             # Generated reports (git-ignored)
 ```
 
+## Tests
+
+```bash
+pip3 install pytest
+python3 -m pytest tests/
+```
+
+The suite uses a temp SQLite database and a mocked `nightscout_client` (no network, no real package needed). It covers ns_sync idempotency (sync twice → no duplicates), cross-source glucose dedup, dose classification, and the monitor's pump rule state transitions.
+
 ## Requirements
 
 - Python 3.9+
 - macOS (for iMessage alerting via `imsg` CLI)
 - Dexcom G7 with Share enabled
-- Optional: Glooko account, Garmin watch with COROS/Garmin Connect export
+- Optional: Nightscout site (Trio/AAPS/Loop uploading) for pump + loop data
+- Optional: Glooko account (historical backfill), Garmin watch with COROS/Garmin Connect export
 
 ## License
 

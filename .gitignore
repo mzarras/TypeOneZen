@@ -9,6 +9,10 @@ data/TypeOneZen.db-wal
 # Import data (CSVs, FIT files — may contain personal health data)
 data/imports/
 
+# Personal tooling — exports from the author's own CorrelateWell instance;
+# intentionally never committed to this public repo
+parsers/export_correlatewell.py
+
 # Generated summaries
 summaries/
 
