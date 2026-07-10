@@ -10,6 +10,8 @@ Features:
 - IOB estimation from bolus/correction doses
 - Snooze mechanism (DB-backed, CLI-controlled)
 - Richer context in alerts (IOB, trend, correction suggestions)
+- Live "current BG" from Nightscout for rules that cite the latest reading
+  (falls back to the newest SQLite row if Nightscout is unavailable/stale)
 - Pump rules via Nightscout: low reservoir, pod age, loop-not-looping
   (these no-op if nightscout-client isn't installed/configured)
 
@@ -64,6 +66,7 @@ POD_WARN_HOURS = 72          # pod age first warning
 POD_URGENT_HOURS = 78        # pod age urgent warning (pod hard-stops at 80h)
 POD_HARD_STOP_HOURS = 80
 LOOP_STALE_MINUTES = 30      # devicestatus older than this → loop-not-looping
+LIVE_BG_MAX_AGE_MINUTES = 15 # live Nightscout reading older than this is stale
 
 # Nightscout client is optional — pump/loop rules no-op if it isn't installed
 try:
@@ -97,6 +100,18 @@ TREND_ARROWS = {
     "falling quickly": "\u21ca",   # ⇊
 }
 
+# Nightscout direction strings → Dexcom-style trend descriptions, so a live
+# Nightscout reading plugs into TREND_RATES/TREND_ARROWS above
+NS_DIRECTION_TO_TREND = {
+    "DoubleUp":      "rising quickly",
+    "SingleUp":      "rising",
+    "FortyFiveUp":   "rising slightly",
+    "Flat":          "steady",
+    "FortyFiveDown": "falling slightly",
+    "SingleDown":    "falling",
+    "DoubleDown":    "falling quickly",
+}
+
 
 # ── Helpers ─────────────────────────────────────────────────────────
 
@@ -108,12 +123,17 @@ def ny_now() -> datetime:
     return datetime.now(NY)
 
 
-def fmt_time_ny(iso_ts: str) -> str:
-    """Format an ISO timestamp as a short NY local time string."""
+def parse_ts_utc(iso_ts: str) -> datetime:
+    """Parse an ISO timestamp, assuming UTC if naive."""
     dt = datetime.fromisoformat(iso_ts)
     if dt.tzinfo is None:
         dt = dt.replace(tzinfo=UTC)
-    return dt.astimezone(NY).strftime("%-I:%M%p").lower()
+    return dt
+
+
+def fmt_time_ny(iso_ts: str) -> str:
+    """Format an ISO timestamp as a short NY local time string."""
+    return parse_ts_utc(iso_ts).astimezone(NY).strftime("%-I:%M%p").lower()
 
 
 def trend_arrow(start: float, end: float) -> str:
@@ -151,6 +171,80 @@ def estimate_iob(conn) -> float:
     return round(total_iob, 2)
 
 
+# ── Live current BG (Nightscout) ────────────────────────────────────
+#
+# Rules that cite the "current" BG try a live Nightscout reading first so
+# alerts never lag behind the 5-minute sync cadence (or race ns_sync's DB
+# writes). Falls back to the newest SQLite row if Nightscout isn't
+# configured/reachable or the reading is stale. Read-only: the live reading
+# is never inserted into the DB — ns_sync owns writes.
+
+_live_bg_state = None  # per-run cache: {"reading": dict|None}
+
+
+def fetch_live_bg() -> dict | None:
+    """Fetch the newest CGM reading live from Nightscout once per run (cached).
+
+    Returns {"glucose_mg_dl": int, "timestamp": ISO-UTC str, "trend": str|None}
+    shaped like a glucose_readings row, or None if Nightscout is not
+    configured, unreachable, errors, or returns an empty/stale result.
+    """
+    global _live_bg_state
+    if _live_bg_state is not None:
+        return _live_bg_state["reading"]
+
+    reading = None
+    if NIGHTSCOUT_AVAILABLE and os.getenv("NIGHTSCOUT_URL"):
+        try:
+            client = NightscoutClient.from_env()
+            entries = client.entries(count=1)  # newest first
+            entry = entries[0] if entries else {}
+            sgv = entry.get("sgv")
+            raw_time = entry.get("time")
+            if sgv is not None and raw_time:
+                ts = parse_ts_utc(raw_time.replace("Z", "+00:00"))
+                age_min = (utc_now() - ts).total_seconds() / 60
+                if age_min <= LIVE_BG_MAX_AGE_MINUTES:
+                    reading = {
+                        "glucose_mg_dl": int(sgv),
+                        "timestamp": ts.astimezone(UTC).isoformat(),
+                        "trend": NS_DIRECTION_TO_TREND.get(entry.get("direction")),
+                    }
+                    print(f"  [BG SOURCE] live Nightscout: {reading['glucose_mg_dl']} "
+                          f"at {fmt_time_ny(reading['timestamp'])} ({age_min:.0f} min old)")
+                else:
+                    print(f"  [BG SOURCE] Nightscout reading stale ({age_min:.0f} min old) "
+                          f"— falling back to SQLite")
+            else:
+                print("  [BG SOURCE] Nightscout returned no usable entry — falling back to SQLite")
+        except Exception as e:
+            print(f"  [BG SOURCE] live Nightscout unavailable ({e}) — falling back to SQLite")
+    else:
+        print("  [BG SOURCE] Nightscout not configured — using SQLite")
+
+    _live_bg_state = {"reading": reading}
+    return reading
+
+
+def get_current_reading(conn) -> dict | None:
+    """Newest BG reading for "current BG" checks.
+
+    Uses the live Nightscout reading when it's fresher than SQLite, else the
+    newest SQLite row. Returns a dict with glucose_mg_dl/timestamp/trend keys
+    (same shape either way), or None if there's no data at all.
+    """
+    row = conn.execute("""
+        SELECT glucose_mg_dl, timestamp, trend FROM glucose_readings
+        ORDER BY timestamp DESC LIMIT 1
+    """).fetchone()
+
+    live = fetch_live_bg()
+    if live is not None and (row is None or
+                             parse_ts_utc(live["timestamp"]) > parse_ts_utc(row["timestamp"])):
+        return live
+    return dict(row) if row is not None else None
+
+
 def get_bg_trend(conn) -> dict:
     """Calculate BG trend from recent readings.
 
@@ -162,10 +256,17 @@ def get_bg_trend(conn) -> dict:
         current_ts: str or None
         dexcom_trend: str or None — raw Dexcom trend string
     """
-    readings = conn.execute("""
+    readings = [dict(r) for r in conn.execute("""
         SELECT glucose_mg_dl, timestamp, trend FROM glucose_readings
         ORDER BY timestamp DESC LIMIT 3
-    """).fetchall()
+    """).fetchall()]
+
+    # Prefer a fresher live Nightscout reading as the "current" one
+    live = fetch_live_bg()
+    if live is not None and (not readings or
+                             parse_ts_utc(live["timestamp"]) > parse_ts_utc(readings[0]["timestamp"])):
+        readings.insert(0, live)
+        readings = readings[:3]
 
     result = {
         "rate_per_15": 0.0,
@@ -516,11 +617,8 @@ def rule_post_meal_spike(conn) -> list[dict]:
         if rise <= 60:
             continue
 
-        # Get current BG
-        current_row = conn.execute("""
-            SELECT glucose_mg_dl, timestamp FROM glucose_readings
-            ORDER BY timestamp DESC LIMIT 1
-        """).fetchone()
+        # Get current BG (live Nightscout when fresher, else newest SQLite row)
+        current_row = get_current_reading(conn)
         if current_row is None:
             continue
 
@@ -597,10 +695,7 @@ def rule_sustained_high(conn) -> list[dict]:
 
     avg_bg = avg_row["avg_bg"]
 
-    current_row = conn.execute("""
-        SELECT glucose_mg_dl, timestamp FROM glucose_readings
-        ORDER BY timestamp DESC LIMIT 1
-    """).fetchone()
+    current_row = get_current_reading(conn)
 
     if current_row is None:
         return []
@@ -667,10 +762,17 @@ def rule_rapid_drop(conn) -> list[dict]:
     if was_recently_alerted(conn, "RAPID_DROP"):
         return []
 
-    readings = conn.execute("""
+    readings = [dict(r) for r in conn.execute("""
         SELECT glucose_mg_dl, timestamp FROM glucose_readings
         ORDER BY timestamp DESC LIMIT 6
-    """).fetchall()
+    """).fetchall()]
+
+    # Prefer a fresher live Nightscout reading as the "current" one
+    live = fetch_live_bg()
+    if live is not None and (not readings or
+                             parse_ts_utc(live["timestamp"]) > parse_ts_utc(readings[0]["timestamp"])):
+        readings.insert(0, live)
+        readings = readings[:6]
 
     if len(readings) < 2:
         return []
@@ -743,10 +845,7 @@ def rule_pre_workout_low_risk(conn) -> list[dict]:
     if not near_workout:
         return []
 
-    current_row = conn.execute("""
-        SELECT glucose_mg_dl, timestamp FROM glucose_readings
-        ORDER BY timestamp DESC LIMIT 1
-    """).fetchone()
+    current_row = get_current_reading(conn)
 
     if current_row is None:
         return []
@@ -815,10 +914,7 @@ def rule_overnight_high(conn) -> list[dict]:
         return []
 
     # Get current BG
-    current_row = conn.execute("""
-        SELECT glucose_mg_dl, timestamp FROM glucose_readings
-        ORDER BY timestamp DESC LIMIT 1
-    """).fetchone()
+    current_row = get_current_reading(conn)
 
     if current_row is None:
         return []

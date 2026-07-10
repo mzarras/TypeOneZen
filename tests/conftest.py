@@ -144,9 +144,11 @@ def conn(tmp_path, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def reset_monitor_globals():
-    """Clear monitor's per-run Nightscout cache and dry-run flag."""
+    """Clear monitor's per-run Nightscout caches and dry-run flag."""
     monitor._ns_state = None
+    monitor._live_bg_state = None
     monitor.DRY_RUN = False
     yield
     monitor._ns_state = None
+    monitor._live_bg_state = None
     monitor.DRY_RUN = False

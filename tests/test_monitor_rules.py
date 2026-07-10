@@ -1,12 +1,15 @@
 """monitor.py Nightscout pump/loop rule tests — state transitions, per-pod
-dedup, and the unreachable-vs-stale distinction.
+dedup, and the unreachable-vs-stale distinction — plus live-BG fetch/fallback.
 
 Pump state is injected by pre-filling monitor's per-run cache (monitor._ns_state),
 so no network or real nightscout-client is involved.
 """
 
+import types
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
+
+from nightscout_client.exceptions import NightscoutConnectionError
 
 import monitor
 
@@ -205,3 +208,97 @@ def test_unreachable_is_distinct_from_stale(conn):
     assert stale[0]["rule"] == "LOOP_STALE"
     assert "unreachable" not in stale[0]["message"].lower()
     assert monitor.rule_nightscout_unreachable(conn) == []
+
+
+# ── Live current BG: Nightscout-first with SQLite fallback ───────────
+
+class _FakeLiveClient:
+    """Minimal client exposing entries() for the live-BG path."""
+
+    def __init__(self, entries=None, raise_exc=None):
+        self._entries = entries or []
+        self._raise = raise_exc
+
+    def entries(self, since=None, until=None, count=None):
+        if self._raise is not None:
+            raise self._raise
+        items = list(self._entries)
+        if count is not None:
+            items = items[:count]
+        return items
+
+
+def install_live_client(monkeypatch, client):
+    """Point monitor's live-BG fetch at a fake client."""
+    monkeypatch.setenv("NIGHTSCOUT_URL", "https://ns.example.test")
+    monkeypatch.setattr(monitor, "NIGHTSCOUT_AVAILABLE", True)
+    monkeypatch.setattr(monitor, "NightscoutClient",
+                        types.SimpleNamespace(from_env=lambda: client))
+    monitor._live_bg_state = None
+
+
+def insert_reading(conn, ts, bg, trend=None):
+    conn.execute(
+        "INSERT INTO glucose_readings (timestamp, glucose_mg_dl, trend) VALUES (?, ?, ?)",
+        (ts, bg, trend),
+    )
+    conn.commit()
+
+
+def test_live_bg_used_when_fresher_than_sqlite(conn, monkeypatch):
+    # The 2026-07-08 race: SQLite still holds a 6-min-old 79 while Nightscout
+    # already has a fresh 71 — the alert must evaluate and cite the 71.
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=6)).isoformat(), 79)
+    install_live_client(monkeypatch, _FakeLiveClient(entries=[
+        {"time": now.isoformat(), "sgv": 71, "direction": "SingleDown"},
+    ]))
+
+    current = monitor.get_current_reading(conn)
+    assert current["glucose_mg_dl"] == 71
+    assert current["trend"] == "falling"
+
+    alerts = monitor.rule_low_warning(conn)
+    assert len(alerts) == 1
+    assert "71" in alerts[0]["message"]
+    assert "79" not in alerts[0]["message"]
+
+
+def test_live_bg_falls_back_when_nightscout_unreachable(conn, monkeypatch):
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=4)).isoformat(), 72, trend="falling")
+    install_live_client(monkeypatch, _FakeLiveClient(
+        raise_exc=NightscoutConnectionError("connection timed out")))
+
+    assert monitor.fetch_live_bg() is None
+    assert monitor.get_current_reading(conn)["glucose_mg_dl"] == 72
+
+    alerts = monitor.rule_low_warning(conn)
+    assert len(alerts) == 1
+    assert "72" in alerts[0]["message"]
+
+
+def test_live_bg_stale_or_empty_falls_back(conn, monkeypatch):
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=4)).isoformat(), 85)
+
+    # Stale live reading (older than LIVE_BG_MAX_AGE_MINUTES) → SQLite wins
+    install_live_client(monkeypatch, _FakeLiveClient(entries=[
+        {"time": (now - timedelta(minutes=45)).isoformat(), "sgv": 60,
+         "direction": "Flat"},
+    ]))
+    assert monitor.fetch_live_bg() is None
+    assert monitor.get_current_reading(conn)["glucose_mg_dl"] == 85
+
+    # Empty result → SQLite wins
+    install_live_client(monkeypatch, _FakeLiveClient(entries=[]))
+    assert monitor.fetch_live_bg() is None
+    assert monitor.get_current_reading(conn)["glucose_mg_dl"] == 85
+
+
+def test_live_bg_degrades_gracefully_under_stub(conn):
+    # conftest's stub NightscoutClient has no from_env(); the fetch must not
+    # raise, and rules must fall back to SQLite as before.
+    insert_reading(conn, datetime.now(UTC).isoformat(), 100)
+    assert monitor.fetch_live_bg() is None
+    assert monitor.get_current_reading(conn)["glucose_mg_dl"] == 100

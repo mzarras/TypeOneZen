@@ -19,14 +19,13 @@
 # Silicon lives at /opt/homebrew/bin) and imsg are found.
 PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 
-# Poll Dexcom Share every 5 minutes (redundant BG source alongside Nightscout)
-*/5 * * * * cd ~/TypeOneZen && python3 poller.py >> logs/cron.log 2>&1
-
-# Sync Nightscout (CGM entries, boluses/SMBs, temp basals, pump-logged carbs) every 5 minutes
-*/5 * * * * cd ~/TypeOneZen && python3 ns_sync.py >> logs/cron.log 2>&1
-
-# Run BG + pump alert monitor every 5 minutes (sends iMessage alerts)
-*/5 * * * * cd ~/TypeOneZen && python3 monitor.py >> logs/monitor.log 2>&1
+# Every 5 minutes, run the data pipeline as ONE chained job so monitor.py
+# never races ns_sync.py's DB writes (they used to be three separate */5
+# jobs and could interleave): Nightscout sync first, then the Dexcom Share
+# poller (redundant BG source), then the BG + pump alert monitor (sends
+# iMessage alerts). Per-command log redirection with ";" separators so one
+# job failing doesn't skip the next.
+*/5 * * * * cd ~/TypeOneZen && { python3 ns_sync.py >> logs/cron.log 2>&1 ; python3 poller.py >> logs/cron.log 2>&1 ; python3 monitor.py >> logs/monitor.log 2>&1 ; }
 
 # Regenerate cached health summary daily at 3am (summaries/health_context.md + stats_cache.json)
 0 3 * * * cd ~/TypeOneZen && python3 parsers/refresh_summary.py >> logs/cron.log 2>&1
@@ -46,12 +45,13 @@ PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 
 # ─────────────────────────────────────────────────────────────────────────
 # NOTE on cadence discrepancy found during setup-kit research: README.md /
-# CLAUDE.md say monitor.py runs every 5 minutes (used above); the OpenClaw
-# skill's SKILL.md "Operational Context" section says "runs every 15 min
-# via cron" instead. This crontab uses 5 minutes per README.md/CLAUDE.md
-# and this task's own instructions. If you'd rather match SKILL.md, change
-# the monitor.py line above to "*/15 * * * *" AND update SKILL.md to match
-# — pick one and make both agree.
+# CLAUDE.md say monitor.py runs every 5 minutes (used above, as part of the
+# single chained */5 pipeline job); the OpenClaw skill's SKILL.md
+# "Operational Context" section says "runs every 15 min via cron" instead.
+# This crontab uses 5 minutes per README.md/CLAUDE.md and this task's own
+# instructions. If you'd rather match SKILL.md, split monitor.py out of the
+# chained line above onto its own "*/15 * * * *" line AND update SKILL.md
+# to match — pick one and make both agree.
 # ─────────────────────────────────────────────────────────────────────────
 
 # ─────────────────────────────────────────────────────────────────────────
