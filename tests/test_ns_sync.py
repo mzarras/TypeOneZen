@@ -6,6 +6,8 @@ Uses the FakeNightscoutClient stub from conftest.py and a temp SQLite db.
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from conftest import FakeNightscoutClient
 
 import ns_sync
@@ -138,6 +140,120 @@ def test_dose_classification_and_basal_units(conn):
     ).fetchone()
     assert meal["carbs_g"] == 45.0
     assert meal["source"] == "nightscout"
+
+
+# ── Effective temp-basal units (stored-effective convention) ─────────
+
+def temp_basal(t_id, minutes_ago, rate, duration):
+    return {"time": iso_minutes_ago(minutes_ago), "event_type": "basal",
+            "raw_event_type": "Temp Basal", "insulin": None, "carbs": None,
+            "duration": duration, "rate": rate, "id": t_id}
+
+
+def basal_units_by_id(conn):
+    return {r["source_id"]: r["units"] for r in conn.execute(
+        "SELECT source_id, units FROM insulin_doses WHERE type = 'basal'"
+    )}
+
+
+def test_new_basal_truncates_prior_scheduled_row(conn):
+    """A temp basal superseded 10 min in delivers rate*10/60, not rate*30/60."""
+    client = FakeNightscoutClient(treatments=[
+        temp_basal("b1", 30, 2.0, 30.0),   # superseded 10 min later
+        temp_basal("b2", 20, 1.0, 30.0),   # newest — no successor yet
+    ])
+    ns_sync.sync(client, conn)
+
+    units = basal_units_by_id(conn)
+    assert units["ns-treatment-b1"] == pytest.approx(2.0 * 10 / 60, abs=1e-4)
+    # The in-progress row keeps its scheduled amount until superseded
+    assert units["ns-treatment-b2"] == pytest.approx(0.5, abs=1e-4)
+
+
+def test_non_overlapping_basal_keeps_full_scheduled_units(conn):
+    """A temp basal whose successor starts after its scheduled end ran in full."""
+    client = FakeNightscoutClient(treatments=[
+        temp_basal("b1", 120, 1.2, 30.0),  # next starts 60 min later → full 0.6
+        temp_basal("b2", 60, 0.8, 30.0),
+    ])
+    ns_sync.sync(client, conn)
+
+    units = basal_units_by_id(conn)
+    assert units["ns-treatment-b1"] == pytest.approx(0.6, abs=1e-4)
+
+
+def test_resync_does_not_reshrink_or_grow_basal_units(conn):
+    """Re-running the sync (overlap window re-fetch) leaves units unchanged."""
+    client = FakeNightscoutClient(treatments=[
+        temp_basal("b1", 40, 2.0, 30.0),
+        temp_basal("b2", 30, 1.5, 30.0),
+        temp_basal("b3", 25, 3.0, 30.0),
+    ])
+    ns_sync.sync(client, conn)
+    first = basal_units_by_id(conn)
+
+    counts = ns_sync.sync(client, conn)
+    assert counts["basal_inserted"] == 0
+    assert basal_units_by_id(conn) == first
+
+    assert first["ns-treatment-b1"] == pytest.approx(2.0 * 10 / 60, abs=1e-4)
+    assert first["ns-treatment-b2"] == pytest.approx(1.5 * 5 / 60, abs=1e-4)
+
+
+def test_backfilled_older_basal_truncated_against_existing_successor(conn):
+    """A basal arriving out of order (backfill) is truncated against the
+    already-stored later temp basal, not left at its scheduled amount."""
+    ns_sync.sync(FakeNightscoutClient(treatments=[
+        temp_basal("late", 20, 1.0, 30.0),
+    ]), conn)
+    ns_sync.sync(FakeNightscoutClient(treatments=[
+        temp_basal("early", 30, 2.4, 30.0),   # 10 min before "late"
+    ]), conn, since_override=iso_minutes_ago(60))
+
+    units = basal_units_by_id(conn)
+    assert units["ns-treatment-early"] == pytest.approx(2.4 * 10 / 60, abs=1e-4)
+    assert units["ns-treatment-late"] == pytest.approx(0.5, abs=1e-4)
+
+
+def test_consumer_day_sum_is_effective_not_scheduled(conn, monkeypatch):
+    """Consumer-level: a window of overlapping temp basals sums to effective
+    units via plain SUM (daily_summary.get_insulin_stats), not scheduled."""
+    import importlib.util
+    from pathlib import Path
+
+    client = FakeNightscoutClient(treatments=[
+        # 18u of scheduled basal, only 0.75u effective
+        temp_basal("b1", 60, 12.0, 30.0),   # superseded after 2.5 min → 0.5
+        temp_basal("b2", 57.5, 6.0, 30.0),  # superseded after 2.5 min → 0.25
+        temp_basal("b3", 55, 0.0, 30.0),    # zero rate, in progress → 0.0
+        # plus a 2u bolus
+        {"time": iso_minutes_ago(50), "event_type": "bolus",
+         "raw_event_type": "Meal Bolus", "insulin": 2.0, "carbs": None,
+         "duration": None, "rate": None, "id": "bol1"},
+    ])
+    ns_sync.sync(client, conn)
+
+    spec = importlib.util.spec_from_file_location(
+        "daily_summary_under_test",
+        Path(__file__).resolve().parent.parent / "scripts" / "daily_summary.py",
+    )
+    daily_summary = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(daily_summary)
+
+    import db
+    monkeypatch.setattr(daily_summary, "DB_PATH", db.DB_PATH)
+
+    now = datetime.now(UTC)
+    stats = daily_summary.get_insulin_stats(now - timedelta(hours=2), now)
+
+    # Naive scheduled SUM would be 18u basal + 2u bolus = 20u
+    assert stats["basal"] == pytest.approx(0.8, abs=0.05)   # 0.5 + 0.25 + 0
+    assert stats["bolus"] == pytest.approx(2.0, abs=0.01)
+    assert stats["total"] == pytest.approx(2.8, abs=0.05)
+    # Bug fix: breakdown uses real dose types — no phantom 'meal' type
+    assert "meal" not in stats
+    assert set(stats) == {"total", "bolus", "basal", "correction",
+                          "correction_count", "count"}
 
 
 def test_cursor_advances(conn):

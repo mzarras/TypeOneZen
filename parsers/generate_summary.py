@@ -184,7 +184,13 @@ def compute_bg_stats(readings):
 
 
 def compute_insulin_stats(doses):
-    """Compute insulin stats from a list of dose dicts."""
+    """Compute insulin stats from a list of dose dicts.
+
+    Basal rows (type='basal') store EFFECTIVE delivered units — ns_sync.py
+    truncates each temp basal against its successor and the one-time
+    backfill (parsers/backfill_basal_effective.py) rewrote history — so a
+    plain sum over stored units is correct here (see basal_effective.py).
+    """
     if not doses:
         return {"total_units": 0, "bolus_units": 0, "basal_units": 0, "correction_units": 0, "count": 0}
     total = sum(d["units"] for d in doses)

@@ -7,7 +7,9 @@ Designed to be run every 5 minutes via cron (see run_ns_sync.sh).
 What gets synced:
 - Entries (CGM readings)      → glucose_readings  (source='nightscout')
 - Bolus treatments            → insulin_doses     (type='bolus' or 'correction')
-- Temp basal treatments       → insulin_doses     (type='basal')
+- Temp basal treatments       → insulin_doses     (type='basal'; units are
+  the EFFECTIVE delivered amount — the loop supersedes temp basals early,
+  so each row is truncated against its successor; see basal_effective.py)
 - Carb treatments             → meals             (source='nightscout')
 
 Idempotency: every synced row stores the Nightscout record ID in the
@@ -46,6 +48,7 @@ from dotenv import load_dotenv
 import os
 
 from db import get_db, ensure_sync_schema
+from basal_effective import effective_units, parse_rate_duration, parse_ts_utc
 
 try:
     from nightscout_client import NightscoutClient
@@ -233,6 +236,74 @@ def sync_entries(client, conn, since: str) -> tuple[int, int]:
 
 # ── Sync: treatments → insulin_doses + meals ───────────────────────
 
+def _minutes_between(earlier_iso: str, later_iso: str) -> float:
+    return (parse_ts_utc(later_iso) - parse_ts_utc(earlier_iso)).total_seconds() / 60.0
+
+
+def reconcile_basal_neighbors(conn, ts_utc: str) -> None:
+    """Recompute EFFECTIVE units around a just-inserted temp-basal row.
+
+    Temp basals are stored with effective delivered units (see
+    basal_effective.py): rate x min(scheduled_duration, minutes until the
+    next temp basal starts) / 60. When a new temp basal arrives it may
+    supersede the previous one before its scheduled end, so:
+
+      (a) the immediately-preceding basal row is truncated against the new
+          row's start time, and
+      (b) the new row itself is truncated against the immediately-following
+          basal row, if one already exists (out-of-order / backfill syncs).
+
+    The recompute is deterministic — purely a function of each row's
+    rate/duration (kept in notes) and its successor's start time — so
+    re-running a sync never double-shrinks or grows anything.
+    """
+    prev = conn.execute(
+        """
+        SELECT id, timestamp, units, notes FROM insulin_doses
+        WHERE type = 'basal' AND timestamp < ?
+        ORDER BY timestamp DESC LIMIT 1
+        """,
+        (ts_utc,),
+    ).fetchone()
+    if prev is not None:
+        parsed = parse_rate_duration(prev["notes"])
+        if parsed is not None:
+            rate, duration = parsed
+            new_units = effective_units(rate, duration, _minutes_between(prev["timestamp"], ts_utc))
+            if abs(new_units - prev["units"]) > 1e-9:
+                conn.execute(
+                    "UPDATE insulin_doses SET units = ? WHERE id = ?",
+                    (new_units, prev["id"]),
+                )
+
+    row = conn.execute(
+        """
+        SELECT id, units, notes FROM insulin_doses
+        WHERE type = 'basal' AND timestamp = ?
+        LIMIT 1
+        """,
+        (ts_utc,),
+    ).fetchone()
+    nxt = conn.execute(
+        """
+        SELECT timestamp FROM insulin_doses
+        WHERE type = 'basal' AND timestamp > ?
+        ORDER BY timestamp ASC LIMIT 1
+        """,
+        (ts_utc,),
+    ).fetchone()
+    if row is not None and nxt is not None:
+        parsed = parse_rate_duration(row["notes"])
+        if parsed is not None:
+            rate, duration = parsed
+            new_units = effective_units(rate, duration, _minutes_between(ts_utc, nxt["timestamp"]))
+            if abs(new_units - row["units"]) > 1e-9:
+                conn.execute(
+                    "UPDATE insulin_doses SET units = ? WHERE id = ?",
+                    (new_units, row["id"]),
+                )
+
+
 def classify_bolus(treatment: dict) -> str:
     """Classify a bolus treatment as 'bolus' or 'correction'.
 
@@ -292,7 +363,9 @@ def sync_treatments(client, conn, since: str) -> dict:
             duration = t.get("duration")
             units = insulin
             if units is None and rate is not None and duration is not None:
-                # rate is U/hr, duration is minutes → delivered = rate * (duration / 60)
+                # Insert at the scheduled amount (rate U/hr for `duration` min);
+                # reconcile_basal_neighbors() below truncates it to EFFECTIVE
+                # delivered units as soon as a superseding temp basal is known.
                 units = round(rate * (duration / 60.0), 4)
             if units is None:
                 continue
@@ -305,6 +378,10 @@ def sync_treatments(client, conn, since: str) -> dict:
                 """,
                 (ts_utc, units, notes, source_id),
             )
+            # The Trio loop usually supersedes each temp basal well before its
+            # scheduled end — truncate the previous row (and this one, if a
+            # later temp basal already exists) to effective delivered units.
+            reconcile_basal_neighbors(conn, ts_utc)
             counts["basal_inserted"] += 1
             continue
 

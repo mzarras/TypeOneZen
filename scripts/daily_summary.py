@@ -14,6 +14,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -132,6 +133,11 @@ def get_bg_stats(start_dt, end_dt):
 
 
 def get_insulin_stats(start_dt, end_dt):
+    # Dose types written by ns_sync.py are 'bolus', 'correction', and 'basal'.
+    # Basal rows store EFFECTIVE delivered units (ns_sync truncates each temp
+    # basal against its successor; see basal_effective.py), so a plain SUM is
+    # correct here. Only the most recent in-progress temp basal may briefly
+    # count at its scheduled amount until the next one arrives.
     conn = get_db()
     rows = conn.execute(
         "SELECT units, type FROM insulin_doses WHERE timestamp >= ? AND timestamp <= ?",
@@ -139,10 +145,12 @@ def get_insulin_stats(start_dt, end_dt):
     ).fetchall()
     conn.close()
     if not rows:
-        return {"total": 0, "meal": 0, "correction": 0, "correction_count": 0, "count": 0}
+        return {"total": 0, "bolus": 0, "basal": 0, "correction": 0,
+                "correction_count": 0, "count": 0}
     return {
         "total": round(sum(r["units"] for r in rows), 1),
-        "meal": round(sum(r["units"] for r in rows if r["type"] == "meal"), 1),
+        "bolus": round(sum(r["units"] for r in rows if r["type"] == "bolus"), 1),
+        "basal": round(sum(r["units"] for r in rows if r["type"] == "basal"), 1),
         "correction": round(sum(r["units"] for r in rows if r["type"] == "correction"), 1),
         "correction_count": sum(1 for r in rows if r["type"] == "correction"),
         "count": len(rows),
@@ -451,8 +459,10 @@ def build_morning():
     if insulin_yest["total"] > 0:
         i = insulin_yest
         parts = []
-        if i["meal"] > 0:
-            parts.append(f"{i['meal']}u meal")
+        if i["bolus"] > 0:
+            parts.append(f"{i['bolus']}u bolus")
+        if i["basal"] > 0:
+            parts.append(f"{i['basal']}u basal")
         if i["correction"] > 0:
             parts.append(f"{i['correction']}u correction ({i['correction_count']}x)")
         lines.append(f"Insulin: {i['total']}u — {', '.join(parts)}" if parts else f"Insulin: {i['total']}u")
@@ -729,11 +739,22 @@ def main():
         print("Error: ALERT_PHONE must be set in .env")
         return
 
-    result = subprocess.run([IMSG, "send", "--to", PHONE, "--text", message], capture_output=True, text=True)
-    if result.returncode == 0:
-        print("✅ Sent via iMessage")
-    else:
-        print(f"❌ Send failed: {result.stderr}")
+    # imsg sends fail transiently from cron sometimes (monitor.py sees the
+    # same: exit 1 with empty stderr, then the identical command succeeds
+    # minutes later). This is a once-a-day message, so retry a few times and
+    # log stdout + stderr + exit code so a real failure is diagnosable.
+    attempts = 3
+    for attempt in range(1, attempts + 1):
+        result = subprocess.run([IMSG, "send", "--to", PHONE, "--text", message],
+                                capture_output=True, text=True)
+        if result.returncode == 0:
+            print("✅ Sent via iMessage")
+            return
+        detail = " | ".join(p for p in (result.stdout.strip(), result.stderr.strip()) if p)
+        print(f"❌ Send failed (attempt {attempt}/{attempts}, "
+              f"exit {result.returncode}): {detail or '(no output)'}")
+        if attempt < attempts:
+            time.sleep(30)
 
 
 if __name__ == "__main__":

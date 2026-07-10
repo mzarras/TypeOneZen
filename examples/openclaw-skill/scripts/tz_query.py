@@ -260,7 +260,14 @@ def cmd_range(args):
 
 
 def cmd_insulin(args):
-    """Insulin doses over last N hours."""
+    """Insulin doses over last N hours.
+
+    type='basal' rows store EFFECTIVE delivered units (ns_sync.py truncates
+    each temp basal when the loop supersedes it early; history was rewritten
+    by parsers/backfill_basal_effective.py), so plain sums over stored units
+    are correct. Only the most recent in-progress temp basal may briefly
+    count at its full scheduled amount until the next one arrives.
+    """
     hours = args.hours
     conn = get_db()
     cutoff = (utc_now() - timedelta(hours=hours)).isoformat()
@@ -472,6 +479,8 @@ def cmd_day(args):
         bg = {"avg": None, "min": None, "max": None, "tir_pct": None,
               "count": 0, "below_70": 0, "above_180": 0}
 
+    # Plain SUM is correct: basal rows store effective delivered units
+    # (see cmd_insulin docstring).
     dose_rows = conn.execute("""
         SELECT units, type FROM insulin_doses
         WHERE timestamp >= ? AND timestamp < ?
@@ -606,6 +615,8 @@ def cmd_week(args):
         """, (start.isoformat(), end.isoformat())).fetchall()
         values = [r["glucose_mg_dl"] for r in bg_rows]
 
+        # Plain SUM is correct: basal rows store effective delivered units
+        # (see cmd_insulin docstring).
         dose_rows = conn.execute("""
             SELECT units FROM insulin_doses
             WHERE timestamp >= ? AND timestamp < ?
