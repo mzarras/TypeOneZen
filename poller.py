@@ -7,6 +7,7 @@ Designed to be run every 5 minutes via cron or a scheduler.
 
 import logging
 import sys
+from datetime import datetime, timezone
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
@@ -62,20 +63,39 @@ def poll() -> None:
         mg_dl, trend_arrow, trend, timestamp,
     )
 
-    # Check for duplicate
+    # Normalize to UTC (all timestamps are stored as ISO8601 UTC; Dexcom
+    # Share returns local-offset timestamps)
+    dt = datetime.fromisoformat(timestamp)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt_utc = dt.astimezone(timezone.utc)
+    timestamp = dt_utc.isoformat()
+    minute_key = dt_utc.strftime("%Y-%m-%dT%H:%M")
+
+    # Cross-source dedup at minute granularity — the same CGM reading also
+    # arrives via ns_sync.py with a slightly different timestamp, same as
+    # ns_sync.py/parse_glooko.py/parse_correlatewell.py do in the other
+    # direction. Only recent rows need checking; julianday normalizes the
+    # mixed UTC/offset timestamp formats already in the table.
     conn = get_db()
     cursor = conn.cursor()
     cursor.execute(
-        "SELECT id FROM glucose_readings WHERE timestamp = ?",
+        "SELECT timestamp FROM glucose_readings "
+        "WHERE julianday(timestamp) >= julianday(?) - 0.02",
         (timestamp,),
     )
-    existing = cursor.fetchone()
-
-    if existing:
-        logger.info("Duplicate reading — already stored for %s", timestamp)
-        print("No new reading (latest already stored)")
-        conn.close()
-        sys.exit(0)
+    for (existing_ts,) in cursor.fetchall():
+        try:
+            existing_dt = datetime.fromisoformat(existing_ts)
+        except (ValueError, TypeError):
+            continue
+        if existing_dt.tzinfo is None:
+            existing_dt = existing_dt.replace(tzinfo=timezone.utc)
+        if existing_dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M") == minute_key:
+            logger.info("Duplicate reading — already stored for %s", minute_key)
+            print("No new reading (latest already stored)")
+            conn.close()
+            sys.exit(0)
 
     # Insert new reading
     cursor.execute(
