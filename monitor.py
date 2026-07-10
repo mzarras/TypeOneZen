@@ -35,6 +35,7 @@ import os
 import re
 import subprocess
 import sys
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -68,6 +69,8 @@ POD_URGENT_HOURS = 78        # pod age urgent warning (pod hard-stops at 80h)
 POD_HARD_STOP_HOURS = 80
 LOOP_STALE_MINUTES = 30      # devicestatus older than this → loop-not-looping
 LIVE_BG_MAX_AGE_MINUTES = 15 # live Nightscout reading older than this is stale
+NO_DATA_MINUTES = 35         # newest reading older than this → data has gone
+                             # silent (CGM posts every 5 min = 7 missed readings)
 
 # ── Low-alert tiers (loop-aware) ─────────────────────────────────────
 # Backtested against 7 months of this user's CGM data (2025-12 → 2026-07):
@@ -648,17 +651,73 @@ def was_recently_alerted(conn, rule_name: str, hours: float = 2.0) -> bool:
 
 
 def send_imsg(message: str):
-    """Send an iMessage via the imsg CLI tool."""
+    """Send an iMessage via the imsg CLI tool.
+
+    Safety-critical, so this retries up to 3 attempts total with backoff
+    (10s, then 30s) before giving up — worst case ~40s of sleeping, safely
+    under the 5-min cron interval. On final failure this re-raises so
+    main() still logs sent=0, which the sent=1 escalation filter turns into
+    a natural retry on the next cron run.
+    """
     if not PHONE:
         raise RuntimeError("ALERT_PHONE not set in .env")
-    subprocess.run(
-        [IMSG, "send", "--to", PHONE, "--text", message],
-        check=True,
-        capture_output=True,
-    )
+
+    backoffs = [10, 30]
+    attempts = len(backoffs) + 1
+    for attempt in range(attempts):
+        try:
+            subprocess.run(
+                [IMSG, "send", "--to", PHONE, "--text", message],
+                check=True,
+                capture_output=True,
+            )
+            return
+        except Exception:
+            if attempt == attempts - 1:
+                raise
+            time.sleep(backoffs[attempt])
 
 
 # ── Rule implementations ───────────────────────────────────────────
+
+def rule_no_recent_data(conn) -> list[dict]:
+    """Rule 0: No recent CGM data — the ONLY rule that must work when there
+    is no current reading at all. Every other rule in this file needs a
+    current BG to evaluate, so a dead sensor, a phone left away from the
+    CGM, or a stalled sync pipeline produce total silence instead of an
+    alert (this is what happened during a silent 4.8h overnight CGM gap in
+    June 2026).
+
+    Fires when the newest available reading — the newer of the newest
+    glucose_readings row and a live Nightscout reading (get_current_reading
+    already resolves that comparison; fetch_live_bg has already discarded
+    anything >LIVE_BG_MAX_AGE_MINUTES old) — is older than NO_DATA_MINUTES,
+    or there's no reading at all. Uses a 2h cooldown (was_recently_alerted,
+    same pattern as RAPID_DROP) so a persistent outage reminds every 2h
+    instead of every 5-min cron run.
+    """
+    current = get_current_reading(conn)
+
+    if current is None:
+        msg = (
+            "\U0001f4f5 No CGM data on record. Check sensor/phone/Nightscout "
+            "— BG alerts are blind until data returns."
+        )
+    else:
+        gap_min = (utc_now() - parse_ts_utc(current["timestamp"])).total_seconds() / 60
+        if gap_min <= NO_DATA_MINUTES:
+            return []
+        msg = (
+            f"\U0001f4f5 No CGM data for {gap_min:.0f} min "
+            f"(last: {current['glucose_mg_dl']} at {fmt_time_ny(current['timestamp'])}). "
+            f"Check sensor/phone/Nightscout — BG alerts are blind until data returns."
+        )
+
+    if was_recently_alerted(conn, "NO_RECENT_DATA", hours=2.0):
+        return []
+
+    return [{"rule": "NO_RECENT_DATA", "message": msg}]
+
 
 _MAX_BASAL_RE = re.compile(r"maxSafeBasal:?\s*([\d.]+)", re.I)
 
@@ -1391,6 +1450,10 @@ def main():
     # Run all rules and collect alerts
     all_alerts = []
     rules = [
+        # NO_RECENT_DATA must run first — it's the only rule that still
+        # needs to work when there is no current reading at all (every
+        # other rule below silently no-ops without one).
+        ("NO_RECENT_DATA", rule_no_recent_data),
         ("HIGH_STUCK", rule_high_stuck),
         ("RAPID_DROP", rule_rapid_drop),
         # PRE_WORKOUT_LOW_RISK: disabled from auto-monitor.

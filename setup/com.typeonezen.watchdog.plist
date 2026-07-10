@@ -1,0 +1,42 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  TypeOneZen watchdog LaunchAgent.
+
+  Runs scripts/watchdog.py under launchd — a scheduler independent of cron
+  (see setup/crontab.txt) — every 5 minutes, so it keeps watching the
+  ns_sync/poller/monitor pipeline even if cron itself dies or the Mac
+  reboots without cron re-registering.
+
+  YOUR_MAC_USERNAME below is a fill-in point (same convention as
+  setup/openclaw.json.example's dbPath and setup/SETUP.md's crontab
+  header) — launchd plists take literal absolute paths, no ~ expansion,
+  so the real macOS short username must be substituted before this file
+  is usable. setup/install_watchdog.sh does this automatically (sed into
+  a temp copy) when installing to ~/Library/LaunchAgents/; this tracked
+  copy keeps the placeholder so it stays generic across machines.
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.typeonezen.watchdog</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/opt/homebrew/bin/python3</string>
+        <string>/Users/YOUR_MAC_USERNAME/TypeOneZen/scripts/watchdog.py</string>
+    </array>
+
+    <key>StartInterval</key>
+    <integer>300</integer>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>StandardOutPath</key>
+    <string>/Users/YOUR_MAC_USERNAME/TypeOneZen/logs/watchdog_launchd.log</string>
+
+    <key>StandardErrorPath</key>
+    <string>/Users/YOUR_MAC_USERNAME/TypeOneZen/logs/watchdog_launchd.log</string>
+</dict>
+</plist>

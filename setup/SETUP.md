@@ -744,3 +744,111 @@ cd ~/TypeOneZen
 git pull
 bash setup/install.sh   # re-run — idempotent, picks up new deps/dirs
 ```
+
+## Watchdog (pipeline dead-man's switch)
+
+Section 6 installs `setup/crontab.txt`, which runs `ns_sync.py -> poller.py
+-> monitor.py` every 5 minutes and is the entire BG alerting pipeline. Cron
+has no supervisor of its own — if it dies, nothing currently notices.
+`scripts/watchdog.py` is a second, independent layer that closes that gap.
+
+### What it covers
+
+`scripts/watchdog.py` runs under **launchd**, not cron — a completely
+separate scheduler, so it keeps running even if the cron pipeline itself is
+the thing that's broken. Every 5 minutes it checks, with its own minimal,
+standalone logic (no `db.py`, no `nightscout_client`, `dotenv` optional):
+
+1. **Pipeline heartbeat** — `logs/monitor.log`'s mtime. `monitor.py` prints
+   at least a summary line every run, so a healthy pipeline advances this
+   file's mtime every 5 minutes. Stale past 20 minutes means cron died, the
+   Mac slept/rebooted without cron re-registering, or Python broke at
+   import time before `monitor.py` could log anything at all — exactly the
+   "fails silent" scenario nothing else in this repo detects.
+2. **Data freshness** — newest `glucose_readings` timestamp, read directly
+   from SQLite (read-only connection; the watchdog never writes to the DB).
+   This is a backstop for total blindness even when `monitor.py` itself is
+   dead (so check 1 didn't already catch it) — stale past 60 minutes pages,
+   and an unreadable/corrupt database is itself treated as an alert. Note
+   this is deliberately a looser threshold than `monitor.py`'s own
+   `NO_RECENT_DATA` rule (35 min) — that rule is the fast path when
+   monitoring is alive; this is the slow, independent backstop for when it
+   isn't.
+
+Alerts page directly via `imsg` (same mechanism as `monitor.py`), throttled
+to at most once per 2 hours per check while a condition persists — but the
+throttle resets the moment a check recovers, so a *new* outage always pages
+immediately rather than waiting out an old cooldown. The watchdog always
+exits 0 and logs to `logs/watchdog.log` (`RotatingFileHandler`, same
+convention as the rest of the codebase), so a bug in the watchdog itself
+never looks like a crash to launchd and never blocks the next run.
+
+### What it can't cover
+
+**The Mac being fully asleep or powered off.** launchd doesn't run while
+the machine is asleep, same as cron — so if the whole Mac goes down, both
+the pipeline *and* its watchdog go dark together, silently, with nothing
+running anywhere to notice. This is exactly why Section 6 above sets
+`pmset -a disablesleep 1` and the lid-closed guidance in
+`setup/crontab.txt`'s trailing comment block — keeping the Air awake and on
+AC power is what keeps this whole watchdog layer meaningful in the first
+place. Re-verify that's still configured:
+```bash
+pmset -g | grep -E "^ sleep|disablesleep"
+```
+Expect `sleep      0` and `disablesleep    1` (see Section 6 for the full
+setup).
+
+For the one failure mode neither cron, `monitor.py`'s `NO_RECENT_DATA`
+rule, nor this watchdog can ever detect from *inside* the Mac — the Mac
+being off — set `HEALTHCHECKS_URL` in `.env` (optional; blank by default).
+When set, the watchdog pings that URL (best-effort GET, errors ignored)
+every run *only when both checks pass*. Point it at a
+[healthchecks.io](https://healthchecks.io) check (or any compatible
+dead-man's-switch service) configured to alert you if it *stops* hearing
+from the Mac on schedule — that ping coming from a genuinely separate
+service running on genuinely separate infrastructure is the only thing in
+this stack that can notice "the Mac itself is off." Not configured by this
+runbook by default since it requires an external account; add it whenever
+you want that last layer of coverage.
+
+### Install
+
+```bash
+cd ~/TypeOneZen
+bash setup/install_watchdog.sh
+```
+
+This copies `setup/com.typeonezen.watchdog.plist` to
+`~/Library/LaunchAgents/`, filling in the `YOUR_MAC_USERNAME` placeholder
+the tracked plist ships with (launchd plists take literal absolute paths,
+no `~` expansion — same fill-in-point convention as
+`setup/openclaw.json.example`'s `dbPath`), then loads it with `launchctl
+bootstrap gui/$(id -u)` (falling back to the legacy `launchctl load -w` on
+older macOS versions that don't support `bootstrap`). Idempotent — safe to
+re-run any time (e.g. after editing the plist), since it unloads any
+existing instance first.
+
+**Verify:**
+```bash
+launchctl list | grep typeonezen
+```
+Expect a line for `com.typeonezen.watchdog` (a `0` exit-status column means
+the last run succeeded — `watchdog.py` always exits 0 by design, so any
+other value there means launchd itself couldn't even start the process,
+e.g. a bad `python3` path).
+
+```bash
+tail -20 ~/TypeOneZen/logs/watchdog.log
+```
+Expect `heartbeat check OK` / `data check OK` lines with no alert sent, on
+a healthy pipeline. `~/TypeOneZen/logs/watchdog_launchd.log` catches
+launchd's own stdout/stderr capture (should normally be empty/quiet since
+`watchdog.py` logs through `logs/watchdog.log` instead).
+
+### Uninstall
+
+```bash
+launchctl bootout "gui/$(id -u)" ~/Library/LaunchAgents/com.typeonezen.watchdog.plist
+rm ~/Library/LaunchAgents/com.typeonezen.watchdog.plist
+```

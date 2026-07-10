@@ -16,6 +16,7 @@ import sqlite3
 import subprocess
 import time
 from datetime import datetime, timedelta, timezone
+from datetime import time as dtime
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -36,6 +37,9 @@ ISF = 35
 AIT_HOURS = 3
 TIR_LOW = 70
 TIR_HIGH = 180
+
+# Trio loop data is only trusted when this fresh (see fetch_loop_state()).
+LOOP_MAX_AGE_MINUTES = 15
 
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
@@ -221,17 +225,87 @@ def get_workout_bg(workout):
     }
 
 
+# ── Trio loop state (Nightscout devicestatus) ──────────────────────────────
+#
+# Trio uploads its full oref computation every loop cycle: net IOB (accounts
+# for basal suspensions/temp adjustments the bolus-only decay estimate can't
+# see), COB, eventual_bg, autosens-adjusted ISF, temp_rate, insulin_req,
+# pred_bgs (scenario → 5-min-step mg/dL predictions), and data_age_minutes.
+# Everywhere below prefers this over naive local math when it's fresh.
+
+_loop_cache = None  # per-run cache: {"loop": dict|None}
+
+
+def fetch_loop_state():
+    """Fetch Trio's latest loop computation once per run (cached).
+
+    Returns the nightscout-client loop() dict, or None when Nightscout
+    isn't configured, errors, or the computation is older than
+    LOOP_MAX_AGE_MINUTES. Callers treat None as "no loop visibility" and
+    fall back to local estimates.
+    """
+    global _loop_cache
+    if _loop_cache is not None:
+        return _loop_cache.get("loop")
+
+    loop = None
+    try:
+        from nightscout_client import NightscoutClient
+        data = NightscoutClient.from_env().loop()
+        age = data.get("data_age_minutes") if data else None
+        if data and age is not None and age <= LOOP_MAX_AGE_MINUTES:
+            loop = data
+    except Exception:
+        pass
+
+    _loop_cache = {"loop": loop}
+    return loop
+
+
+def effective_isf(loop):
+    """Trio's autosens-adjusted ISF when `loop` is present and fresh
+    (data_age_minutes <= LOOP_MAX_AGE_MINUTES), else the static ISF
+    constant. Shared by the morning correction-size insight and the
+    evening outlook so both size corrections the same way.
+    """
+    if loop and loop.get("isf") is not None:
+        age = loop.get("data_age_minutes")
+        if age is not None and age <= LOOP_MAX_AGE_MINUTES:
+            return float(loop["isf"])
+    return ISF
+
+
+def loop_predicted_min(loop):
+    """Trio's predicted BG minimum across all its prediction scenarios
+    (IOB/ZT/COB/UAM), falling back to eventual_bg if pred_bgs is absent."""
+    if not loop:
+        return None
+    preds = loop.get("pred_bgs") or {}
+    mins = [min(arr) for arr in preds.values() if arr]
+    if mins:
+        return float(min(mins))
+    eventual = loop.get("eventual_bg")
+    return float(eventual) if eventual is not None else None
+
+
+def describe_loop_action(loop):
+    """Human-readable summary of Trio's current temp basal state."""
+    if not loop:
+        return "no loop data"
+    rate = loop.get("temp_rate")
+    if rate is None:
+        return "loop active"
+    if rate == 0:
+        return "basal suspended"
+    return f"temp basal {rate:g} U/hr"
+
+
 def get_iob():
     # Prefer Trio's own net IOB from Nightscout — it accounts for basal
     # suspensions/temp adjustments the bolus-only decay estimate can't see.
-    try:
-        from nightscout_client import NightscoutClient
-        loop = NightscoutClient.from_env().loop()
-        age = loop.get("data_age_minutes") if loop else None
-        if loop and loop.get("iob") is not None and age is not None and age <= 15:
-            return round(float(loop["iob"]), 2)
-    except Exception:
-        pass
+    loop = fetch_loop_state()
+    if loop is not None and loop.get("iob") is not None:
+        return round(float(loop["iob"]), 2)
 
     cutoff = now_ny() - timedelta(hours=AIT_HOURS)
     conn = get_db()
@@ -262,16 +336,58 @@ def get_tir_historical(days):
     return round(sum(1 for v in vals if TIR_LOW <= v <= TIR_HIGH) / len(vals) * 100)
 
 
+# ── Overnight window helpers (DST-safe) ────────────────────────────────────
+#
+# These used to be computed as SQLite date arithmetic with a hardcoded
+# '-5 hours' EST offset and strftime('%H', ...) hour bands. That's wrong for
+# ~8 months of the year (EDT is UTC-4): every "overnight" stat was shifted
+# an hour in summer. Instead, compute the NY-local window boundaries in
+# Python via zoneinfo (which knows about DST) and pass explicit UTC ISO
+# bounds into the SQL.
+
+def overnight_bounds_utc(night_date, start_hour=22, end_hour=8):
+    """UTC (start_iso, end_iso) bounds for the NY-local overnight window
+    running from start_hour:00 on `night_date` through end_hour:00 the next
+    calendar day (default 10pm-8am)."""
+    start = datetime.combine(night_date, dtime(hour=start_hour), tzinfo=NY)
+    end = datetime.combine(night_date + timedelta(days=1), dtime(hour=end_hour), tzinfo=NY)
+    return to_utc_str(start), to_utc_str(end)
+
+
+def overnight_windows(n_nights, end_ny=None, start_hour=22, end_hour=8):
+    """The last n_nights overnight windows, most recent first, as
+    (night_date, start_utc_iso, end_utc_iso) tuples. night_date is the NY
+    calendar date each window *starts* on (e.g. "night of July 9" runs
+    10pm July 9 - 8am July 10)."""
+    if end_ny is None:
+        end_ny = now_ny()
+    anchor = end_ny.date()
+    if end_ny.hour < start_hour:
+        # We're either still inside last night's window or between its end
+        # and tonight's start — either way the most recent relevant night
+        # started yesterday.
+        anchor -= timedelta(days=1)
+    return [
+        (anchor - timedelta(days=i),) + overnight_bounds_utc(anchor - timedelta(days=i), start_hour, end_hour)
+        for i in range(n_nights)
+    ]
+
+
 def get_30d_overnight_avg():
-    """30-day average overnight BG (10pm–8am NY = UTC 03:00–13:00 at EST)."""
+    """30-day average overnight BG (10pm-8am NY, DST-safe)."""
     conn = get_db()
-    row = conn.execute(
-        "SELECT AVG(glucose_mg_dl) as avg FROM glucose_readings "
-        "WHERE (strftime('%H', timestamp) >= '03' AND strftime('%H', timestamp) < '13') "
-        "AND timestamp >= datetime('now', '-30 days')"
-    ).fetchone()
+    total, count = 0.0, 0
+    for _, start_iso, end_iso in overnight_windows(30):
+        row = conn.execute(
+            "SELECT SUM(glucose_mg_dl) as s, COUNT(*) as c FROM glucose_readings "
+            "WHERE timestamp >= ? AND timestamp < ?",
+            (start_iso, end_iso)
+        ).fetchone()
+        if row and row["c"]:
+            total += row["s"]
+            count += row["c"]
     conn.close()
-    return round(row["avg"]) if row and row["avg"] else None
+    return round(total / count) if count else None
 
 
 # ── Smart insights ─────────────────────────────────────────────────────────────
@@ -329,24 +445,28 @@ def insight_low_patterns():
 def insight_workout_overnight_pattern():
     """Do workout days lead to higher overnight BG?"""
     conn = get_db()
-    workout_days = {r["day"] for r in conn.execute(
-        "SELECT DISTINCT date(datetime(started_at, '-5 hours')) as day FROM workouts "
-        "WHERE started_at >= datetime('now', '-60 days')"
-    ).fetchall()}
+    cutoff = to_utc_str(now_ny() - timedelta(days=60))
+    workout_days = set()
+    for r in conn.execute(
+        "SELECT started_at FROM workouts WHERE started_at >= ?", (cutoff,)
+    ).fetchall():
+        dt = from_utc_str(r["started_at"])
+        if dt:
+            workout_days.add(dt.date())
 
     if len(workout_days) < 3:
         conn.close()
         return None
 
     workout_nights, rest_nights = [], []
-    for row in conn.execute(
-        "SELECT date(datetime(timestamp, '-5 hours')) as ny_date, AVG(glucose_mg_dl) as avg "
-        "FROM glucose_readings "
-        "WHERE strftime('%H', timestamp) >= '03' AND strftime('%H', timestamp) < '13' "
-        "AND timestamp >= datetime('now', '-60 days') GROUP BY ny_date"
-    ).fetchall():
-        if row["avg"]:
-            (workout_nights if row["ny_date"] in workout_days else rest_nights).append(row["avg"])
+    for night_date, start_iso, end_iso in overnight_windows(60):
+        row = conn.execute(
+            "SELECT AVG(glucose_mg_dl) as avg FROM glucose_readings "
+            "WHERE timestamp >= ? AND timestamp < ?",
+            (start_iso, end_iso)
+        ).fetchone()
+        if row and row["avg"]:
+            (workout_nights if night_date in workout_days else rest_nights).append(row["avg"])
     conn.close()
 
     if not workout_nights or not rest_nights:
@@ -360,12 +480,16 @@ def insight_workout_overnight_pattern():
 def insight_correction_day_pattern():
     """Do correction-heavy days lead to worse overnight BG?"""
     conn = get_db()
+    cutoff = to_utc_str(now_ny() - timedelta(days=30))
     corr_by_day = {}
     for r in conn.execute(
-        "SELECT date(datetime(timestamp, '-5 hours')) as d, COUNT(*) as cnt "
-        "FROM insulin_doses WHERE type='correction' AND timestamp >= datetime('now', '-30 days') GROUP BY d"
+        "SELECT timestamp FROM insulin_doses WHERE type='correction' AND timestamp >= ?",
+        (cutoff,)
     ).fetchall():
-        corr_by_day[r["d"]] = r["cnt"]
+        dt = from_utc_str(r["timestamp"])
+        if dt:
+            d = dt.date()
+            corr_by_day[d] = corr_by_day.get(d, 0) + 1
 
     heavy_days = {d for d, c in corr_by_day.items() if c >= 2}
     if len(heavy_days) < 3:
@@ -373,16 +497,16 @@ def insight_correction_day_pattern():
         return None
 
     heavy_nights, clean_nights = [], []
-    for row in conn.execute(
-        "SELECT date(datetime(timestamp, '-5 hours')) as d, AVG(glucose_mg_dl) as avg "
-        "FROM glucose_readings "
-        "WHERE strftime('%H', timestamp) >= '03' AND strftime('%H', timestamp) < '13' "
-        "AND timestamp >= datetime('now', '-30 days') GROUP BY d"
-    ).fetchall():
-        if row["avg"]:
-            if row["d"] in heavy_days:
+    for night_date, start_iso, end_iso in overnight_windows(30):
+        row = conn.execute(
+            "SELECT AVG(glucose_mg_dl) as avg FROM glucose_readings "
+            "WHERE timestamp >= ? AND timestamp < ?",
+            (start_iso, end_iso)
+        ).fetchone()
+        if row and row["avg"]:
+            if night_date in heavy_days:
                 heavy_nights.append(row["avg"])
-            elif corr_by_day.get(row["d"], 0) <= 1:
+            elif corr_by_day.get(night_date, 0) <= 1:
                 clean_nights.append(row["avg"])
     conn.close()
 
@@ -398,16 +522,24 @@ def insight_correction_day_pattern():
 
 def count_consecutive_overnight_highs():
     conn = get_db()
-    nights = conn.execute(
-        "SELECT date(datetime(timestamp, '-5 hours')) as d, AVG(glucose_mg_dl) as avg "
-        "FROM glucose_readings "
-        "WHERE strftime('%H', timestamp) >= '03' AND strftime('%H', timestamp) < '13' "
-        "AND timestamp >= datetime('now', '-7 days') GROUP BY d ORDER BY d DESC LIMIT 5"
-    ).fetchall()
+    nights = []
+    # Look back up to 10 nights to find the most recent 5 that have data
+    # (mirrors the original's "last 7 days, up to 5 nights" pool with a
+    # small buffer for gaps).
+    for _, start_iso, end_iso in overnight_windows(10):
+        row = conn.execute(
+            "SELECT AVG(glucose_mg_dl) as avg FROM glucose_readings "
+            "WHERE timestamp >= ? AND timestamp < ?",
+            (start_iso, end_iso)
+        ).fetchone()
+        if row and row["avg"] is not None:
+            nights.append(row["avg"])
+        if len(nights) >= 5:
+            break
     conn.close()
     count = 0
-    for n in nights:
-        if n["avg"] and n["avg"] > 155:
+    for avg in nights:
+        if avg > 155:
             count += 1
         else:
             break
@@ -502,7 +634,8 @@ def build_morning():
     # Consecutive overnight highs
     consec = count_consecutive_overnight_highs()
     if overnight and overnight["avg"] > 155 and consec >= 3:
-        small_corr = round((overnight["avg"] - TARGET_BG) / ISF * 0.4, 1)
+        isf = effective_isf(fetch_loop_state())
+        small_corr = round((overnight["avg"] - TARGET_BG) / isf * 0.4, 1)
         insight = (
             f"⚠️ This is night {consec} in a row with overnight avg above 155 "
             f"(last night: {overnight['avg']}). "
@@ -555,6 +688,82 @@ def build_morning():
         lines.append("💡 Active yesterday — insulin sensitivity may still be elevated today.")
 
     return "\n".join(lines).strip()
+
+
+def build_evening_outlook(bg_now, iob, loop):
+    """Pure: overnight outlook text for the evening summary's "Tonight:"
+    line, from (current BG, IOB, Trio's loop dict-or-None).
+
+    `loop` must already be freshness-filtered (data_age_minutes <=
+    LOOP_MAX_AGE_MINUTES) — pass fetch_loop_state()'s return value, or None
+    to force the no-loop-data fallback path. Returns "" when there's
+    nothing worth saying.
+
+    With fresh loop data this quotes Trio's own forecast (eventual_bg,
+    predicted overnight minimum, temp basal state, COB) instead of naive
+    local math — no more `bg_now - (iob * ISF * 0.4)` "by midnight"
+    projections built on a static ISF and blind to the loop's own
+    countermeasures. A snack is suggested only when Trio's own predicted
+    minimum is under 80; a correction is flagged only when Trio's own
+    eventual_bg is above 180, citing Trio's insulin_req rather than local
+    ISF math.
+    """
+    if loop is not None:
+        eventual = loop.get("eventual_bg")
+        pred_min = loop_predicted_min(loop)
+        cob = loop.get("cob") or 0
+        insulin_req = loop.get("insulin_req")
+
+        forecast_bits = []
+        if eventual is not None:
+            forecast_bits.append(f"eventual BG ~{round(eventual)}")
+        if pred_min is not None:
+            forecast_bits.append(f"predicted low ~{round(pred_min)}")
+        forecast_bits.append(describe_loop_action(loop))
+        if cob > 0:
+            forecast_bits.append(f"{round(cob)}g COB")
+        forecast = "Trio's forecast: " + ", ".join(forecast_bits) + "."
+
+        snack_needed = pred_min is not None and pred_min < 80
+        correction_flag = eventual is not None and eventual > 180
+
+        if not snack_needed and not correction_flag:
+            if eventual is not None:
+                return f"Trio predicts landing ~{round(eventual)} — overnight looks clear."
+            return forecast + " Overnight looks clear."
+
+        msg = forecast
+        if snack_needed:
+            msg += (f" ⚠️ Trio predicts a dip to ~{round(pred_min)} overnight — "
+                     f"a small snack (~15g carbs) is worth considering.")
+        if correction_flag:
+            req = f", insulin_req {insulin_req:.2f}u" if insulin_req else ""
+            msg += (f" ⚠️ Eventual BG {round(eventual)} is above target{req} — "
+                     f"the loop is already working on it, but worth a check-in.")
+        return msg
+
+    # No fresh loop data — keep a simplified, clearly-labeled rough estimate
+    # using the module's static AIT/ISF constants.
+    if bg_now is None:
+        return ""
+
+    iob = iob or 0
+    if iob >= 1.0:
+        projected = round(bg_now - (iob * ISF * 0.4))
+        if projected < 85:
+            snack_g = round(iob * 4 * 0.5)
+            return (f"(rough estimate — no loop data) {iob}u IOB with BG at {bg_now} — "
+                     f"could push toward {projected} by midnight. A small snack "
+                     f"(~{snack_g}g carbs) might be worth it.")
+
+    if 85 <= bg_now <= 160 and iob < 0.5:
+        return f"(rough estimate — no loop data) BG {bg_now}, no significant IOB. Sleep well."
+    if bg_now > 165 and iob < 0.5:
+        small_corr = round((bg_now - TARGET_BG) / ISF, 1)
+        return (f"(rough estimate — no loop data) BG is {bg_now} with no IOB — "
+                 f"a correction (~{small_corr}u) now could prevent an overnight high.")
+
+    return ""
 
 
 def build_evening():
@@ -705,20 +914,9 @@ def build_evening():
                 risk += " Check BG before bed and keep carbs nearby."
             risk_parts.append(risk)
 
-    if iob >= 1.0 and bg_now:
-        projected = round(bg_now - (iob * ISF * 0.4))
-        if projected < 85:
-            risk_parts.append(
-                f"⚠️ {iob}u IOB with BG at {bg_now} — could push toward {projected} by midnight. "
-                f"A small snack (~{round(iob * 4 * 0.5)}g carbs) might be worth it."
-            )
-
-    if not risk_parts:
-        if bg_now and 85 <= bg_now <= 160 and iob < 0.5:
-            risk_parts.append(f"✅ Overnight looks clear — BG {bg_now}, no significant IOB. Sleep well.")
-        elif bg_now and bg_now > 165 and iob < 0.5:
-            small_corr = round((bg_now - TARGET_BG) / ISF, 1)
-            risk_parts.append(f"⚠️ BG is {bg_now} with no IOB — a correction (~{small_corr}u) now could prevent an overnight high.")
+    outlook = build_evening_outlook(bg_now, iob, fetch_loop_state())
+    if outlook:
+        risk_parts.append(outlook)
 
     if risk_parts:
         lines.append("Tonight: " + " ".join(risk_parts))

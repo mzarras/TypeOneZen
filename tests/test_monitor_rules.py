@@ -5,10 +5,12 @@ Pump state is injected by pre-filling monitor's per-run cache (monitor._ns_state
 so no network or real nightscout-client is involved.
 """
 
+import subprocess
 import types
 from datetime import datetime, timedelta
 from zoneinfo import ZoneInfo
 
+import pytest
 from nightscout_client.exceptions import NightscoutConnectionError
 
 import monitor
@@ -644,3 +646,114 @@ def test_failed_sends_do_not_consume_escalation_slots(conn):
     alerts = monitor.rule_low_warning(conn)
     assert len(alerts) == 1
     assert "first alert" not in alerts[0]["message"]
+
+
+# ── NO_RECENT_DATA: silent-outage backstop ────────────────────────────
+#
+# The June 2026 bug: a silent 4.8h overnight CGM gap produced zero alerts
+# because every other rule needs a current reading to evaluate at all.
+
+def test_no_recent_data_fires_when_stale_and_no_live(conn):
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=45)).isoformat(), 118)
+
+    alerts = monitor.rule_no_recent_data(conn)
+    assert len(alerts) == 1
+    msg = alerts[0]["message"]
+    assert "118" in msg
+    assert "45 min" in msg
+
+
+def test_no_recent_data_silent_with_fresh_db_reading(conn):
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=5)).isoformat(), 100)
+    assert monitor.rule_no_recent_data(conn) == []
+
+
+def test_no_recent_data_silent_with_fresh_live_reading(conn, monkeypatch):
+    # Even though the DB row is stale, a fresh live Nightscout reading
+    # means data isn't actually silent.
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=45)).isoformat(), 118)
+    install_live_client(monkeypatch, _FakeLiveClient(entries=[
+        {"time": now.isoformat(), "sgv": 100, "direction": "Flat"},
+    ]))
+    assert monitor.rule_no_recent_data(conn) == []
+
+
+def test_no_recent_data_fires_when_db_empty(conn):
+    alerts = monitor.rule_no_recent_data(conn)
+    assert len(alerts) == 1
+    assert "no cgm data" in alerts[0]["message"].lower()
+
+
+def test_no_recent_data_two_hour_cooldown(conn):
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=45)).isoformat(), 118)
+
+    alerts = monitor.rule_no_recent_data(conn)
+    assert len(alerts) == 1
+    log_alert(conn, {"rule": "NO_RECENT_DATA", "message": alerts[0]["message"]})
+
+    # Outage persists, but the 2h cooldown should suppress an immediate re-fire.
+    assert monitor.rule_no_recent_data(conn) == []
+
+
+def test_no_recent_data_failed_send_does_not_suppress_retry(conn):
+    now = datetime.now(UTC)
+    conn.execute(
+        "INSERT INTO alert_log (rule_name, triggered_at, message, sent, dedup_key)"
+        " VALUES (?, ?, ?, 0, NULL)",
+        ("NO_RECENT_DATA", (now - timedelta(minutes=5)).isoformat(), "never delivered"),
+    )
+    conn.commit()
+    insert_reading(conn, (now - timedelta(minutes=45)).isoformat(), 118)
+
+    alerts = monitor.rule_no_recent_data(conn)
+    assert len(alerts) == 1
+
+
+# ── send_imsg: retry with backoff ──────────────────────────────────────
+#
+# Safety priority inversion fix: the routine daily-summary script retried
+# sends 3x while this safety-critical alerter didn't retry at all.
+
+def test_send_imsg_retries_then_succeeds(monkeypatch):
+    monkeypatch.setattr(monitor, "PHONE", "+15555550100")
+
+    calls = {"run": 0}
+    sleeps = []
+
+    def fake_run(*args, **kwargs):
+        calls["run"] += 1
+        if calls["run"] < 3:
+            raise subprocess.CalledProcessError(1, args[0] if args else "imsg")
+        return None
+
+    monkeypatch.setattr(monitor.subprocess, "run", fake_run)
+    monkeypatch.setattr(monitor.time, "sleep", lambda s: sleeps.append(s))
+
+    monitor.send_imsg("test message")
+
+    assert calls["run"] == 3
+    assert sleeps == [10, 30]
+
+
+def test_send_imsg_reraises_after_three_failures(monkeypatch):
+    monkeypatch.setattr(monitor, "PHONE", "+15555550100")
+
+    calls = {"run": 0}
+    sleeps = []
+
+    def fake_run(*args, **kwargs):
+        calls["run"] += 1
+        raise subprocess.CalledProcessError(1, args[0] if args else "imsg")
+
+    monkeypatch.setattr(monitor.subprocess, "run", fake_run)
+    monkeypatch.setattr(monitor.time, "sleep", lambda s: sleeps.append(s))
+
+    with pytest.raises(subprocess.CalledProcessError):
+        monitor.send_imsg("test message")
+
+    assert calls["run"] == 3
+    assert sleeps == [10, 30]
