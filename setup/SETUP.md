@@ -516,9 +516,10 @@ openclaw models auth login --provider anthropic --method cli   # subscription OA
 openclaw gateway restart
 ```
 
-**Option B — API key (predictable, pay-per-token).** Haiku 4.5 at $1/$5 per
-MTok; with the script-routing skill design a typical month should be a few
-dollars:
+**Option B — API key (predictable, pay-per-token).** Cost depends on the
+model you fill into `openclaw.json` (see §7.3) — e.g. Haiku 4.5 at $1/$5
+per MTok is a few dollars a month with the script-routing skill design;
+Sonnet/Opus tiers cost proportionally more:
 
 ```bash
 openclaw onboard --install-daemon --anthropic-api-key "$ANTHROPIC_API_KEY"
@@ -544,6 +545,12 @@ Edit `~/.openclaw/openclaw.json` and replace:
   short username (`whoami`).
 - `+1XXXXXXXXXX` in `channels.imessage.allowFrom` with the real number
   from `ALERT_PHONE` in `.env`.
+- `anthropic/CHOOSE_YOUR_MODEL` in `agents.defaults.model.primary` —
+  a deliberate fill-in point; pick the tier that matches your needs and
+  billing mode (see the comment block in the file: Haiku = cheapest on
+  API-key billing, Sonnet/Opus = more capable; on subscription auth the
+  difference is usage-limit draw, not dollars). Verify your pick with
+  `openclaw models list --provider anthropic --all` after onboarding.
 
 Read the comments in that file for what's VERIFIED against
 `docs.openclaw.ai` vs best-effort — this task required not guessing at
@@ -575,14 +582,13 @@ confirmed:
   (source: `docs.openclaw.ai/start/getting-started`)
 
 **NOT VERIFIED / open questions:**
-- The exact model ID `claude-haiku-4-5` doesn't appear in any fetched
-  docs example (the Anthropic provider page's examples listed
-  `claude-opus-4-8`, `claude-sonnet-5`, `claude-fable-5`,
-  `claude-mythos-5`, `claude-opus-4-7`/`4-6`, `claude-sonnet-4-6` — no
-  Haiku variant). It's used here per this task's explicit requirement,
-  not independently re-confirmed. **Run `openclaw models list --provider
-  anthropic` after onboarding and confirm `claude-haiku-4-5` (or the
-  closest current Haiku alias) is actually listed before relying on it.**
+- ~~The exact model ID `claude-haiku-4-5`~~ **[RESOLVED 2026-07-09 during
+  the first real deployment]**: `openclaw models list --provider
+  anthropic` confirms `anthropic/claude-haiku-4-5` in the default
+  catalog; `--all` additionally lists `claude-sonnet-4-6`, `claude-opus-4-8`,
+  and `claude-fable-5`. Off-catalog refs (e.g. `anthropic/claude-sonnet-5`)
+  are also accepted by the gateway and resolve fine at the API level.
+  The model is now a fill-in point in `openclaw.json.example` — see §7.3.
 - `nativeSkills` (referenced in this repo's own `README.md`) — not found
   in any fetched docs.openclaw.ai page. Likely unnecessary given
   auto-discovery is documented as automatic, but flagged since the

@@ -32,19 +32,21 @@
   // agents.defaults.model.primary, with model refs in "provider/model"
   // form (e.g. "anthropic/claude-opus-4-8" was the example shown).
   //
-  // The MODEL ID ITSELF — "claude-haiku-4-5" — is per this project's
-  // explicit requirement (cost: routes most questions to local scripts
-  // via tz_query.py rather than doing everything in-model). The fetched
-  // docs pages did not list a Haiku model in their examples, so confirm
-  // it's a valid/available ref before relying on it:
-  //   openclaw models list --provider anthropic
-  // If that ID isn't recognized, use the closest available Haiku alias
-  // and update this file + setup/SETUP.md accordingly.
+  // The MODEL ID ITSELF is a FILL-IN POINT — pick per your needs/budget:
+  //   - "anthropic/claude-haiku-4-5"  — cheapest; fine since the skill
+  //     routes most questions to local scripts (tz_query.py) anyway
+  //   - "anthropic/claude-sonnet-5"   — better reasoning for open-ended
+  //     "should I correct?"-style context questions
+  //   - "anthropic/claude-opus-4-8"   — max quality, highest usage draw
+  // On subscription (Max) auth there's no per-token cost difference,
+  // only usage-limit draw; on API-key billing, cost scales with tier.
+  // Confirm your chosen ref is available before relying on it:
+  //   openclaw models list --provider anthropic --all
   "agents": {
     "defaults": {
       "workspace": "~/.openclaw/workspace",
       "model": {
-        "primary": "anthropic/claude-haiku-4-5"
+        "primary": "anthropic/CHOOSE_YOUR_MODEL"
       }
     }
   },
@@ -81,7 +83,19 @@
 
       // VERIFIED keys; lets Zenbot receive meal/pump-screenshot photos.
       "includeAttachments": true,
-      "mediaMaxMb": 16
+      "mediaMaxMb": 16,
+
+      // VERIFIED in deployment (2026-07-09): without these two keys,
+      // replies silently die with "reply_to requires bridge transport;
+      // AppleScript fallback cannot send threaded replies". Threaded
+      // replies need imsg's IMCore bridge, which requires DISABLING SIP
+      // (imsg status) — not acceptable. Force plain AppleScript sends
+      // and turn the threaded-reply action off (source:
+      // docs.openclaw.ai/channels/imessage).
+      "sendTransport": "applescript",
+      "actions": {
+        "reply": false
+      }
     }
   }
 
