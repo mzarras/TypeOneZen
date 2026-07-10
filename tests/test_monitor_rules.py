@@ -302,3 +302,345 @@ def test_live_bg_degrades_gracefully_under_stub(conn):
     insert_reading(conn, datetime.now(UTC).isoformat(), 100)
     assert monitor.fetch_live_bg() is None
     assert monitor.get_current_reading(conn)["glucose_mg_dl"] == 100
+
+
+# ── Loop-aware low alerting ──────────────────────────────────────────
+#
+# The 2026-07-09/10 false-alarm night: 8 LOW_WARNING + 2 RAPID_DROP alerts
+# while Trio had basal suspended and BG never went below 71. New behavior:
+# defer to Trio's own predictions; only page when the loop can't fix it.
+
+def make_loop(**overrides):
+    loop = {
+        "timestamp": datetime.now(UTC).isoformat(),
+        "device": "Trio",
+        "bg": 90.0,
+        "eventual_bg": 95.0,
+        "iob": 0.5,
+        "cob": 0.0,
+        "isf": 42.0,
+        "temp_rate": 0.0,
+        "temp_duration": 60.0,
+        "enacted": True,
+        "reason": "minPredBG 85, IOBpredBG 95; Eventual BG 95 >= 70",
+        "pred_bgs": {"IOB": [90, 88, 86, 85, 86, 88, 91, 95],
+                     "ZT": [90, 87, 85, 85, 87, 90, 94, 99]},
+        "data_age_minutes": 2.0,
+    }
+    loop.update(overrides)
+    return loop
+
+
+def set_loop_state(loop):
+    monitor._loop_state = {"loop": loop}
+
+
+def test_low_suppressed_when_trio_predicts_recovery(conn):
+    # The screenshot case: BG 93 falling -22/15min, loop zero-temped and
+    # predicting a nadir of 85 → old rule paged, new rule stays quiet.
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=10)).isoformat(), 115)
+    insert_reading(conn, (now - timedelta(minutes=5)).isoformat(), 104)
+    insert_reading(conn, now.isoformat(), 93, trend="falling")
+    set_loop_state(make_loop(bg=93.0))
+
+    assert monitor.rule_low_warning(conn) == []
+
+
+def test_low_fires_on_trio_carbs_req(conn):
+    now = datetime.now(UTC)
+    insert_reading(conn, now.isoformat(), 76, trend="falling")
+    set_loop_state(make_loop(
+        bg=76.0, eventual_bg=55.0,
+        reason="minGuardBG 52<66 add 15g carbs req within 30m",
+        pred_bgs={"IOB": [76, 70, 64, 58, 54, 52, 53, 56]},
+    ))
+
+    alerts = monitor.rule_low_warning(conn)
+    assert len(alerts) == 1
+    assert "15g" in alerts[0]["message"]
+    assert "Trio" in alerts[0]["message"]
+
+
+def test_low_fires_when_near_low_and_trio_predicts_below_70(conn):
+    now = datetime.now(UTC)
+    insert_reading(conn, now.isoformat(), 76, trend="falling")
+    set_loop_state(make_loop(
+        bg=76.0, eventual_bg=80.0,
+        pred_bgs={"IOB": [76, 72, 68, 65, 66, 70, 75, 80]},
+    ))
+
+    alerts = monitor.rule_low_warning(conn)
+    assert len(alerts) == 1
+    assert "65" in alerts[0]["message"]  # predicted nadir cited
+
+
+def test_low_below_70_always_alerts_even_with_healthy_loop(conn):
+    now = datetime.now(UTC)
+    insert_reading(conn, now.isoformat(), 64, trend="falling")
+    set_loop_state(make_loop(bg=64.0, eventual_bg=90.0,
+                             pred_bgs={"IOB": [64, 70, 78, 85, 90]}))
+
+    alerts = monitor.rule_low_warning(conn)
+    assert len(alerts) == 1
+    assert "LOW" in alerts[0]["message"]
+    assert "64" in alerts[0]["message"]
+
+
+def test_followup_reverifies_full_conditions(conn):
+    # Regression: "Still trending low: BG 108↘" — a follow-up must re-run
+    # the whole assessment, not just check BG < 80 + stable.
+    log_alert(conn, {"rule": "LOW_WARNING", "message": "first alert"})
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=10)).isoformat(), 118)
+    insert_reading(conn, (now - timedelta(minutes=5)).isoformat(), 112)
+    insert_reading(conn, now.isoformat(), 108, trend="falling slightly")
+    set_loop_state(make_loop(bg=108.0, eventual_bg=105.0,
+                             pred_bgs={"IOB": [108, 106, 104, 103, 104, 106]}))
+
+    assert monitor.rule_low_warning(conn) == []
+
+
+def test_low_fallback_fires_without_loop_when_near_low_falling(conn):
+    # No loop visibility + BG 74 falling → CGM-only backstop still pages.
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=10)).isoformat(), 92)
+    insert_reading(conn, (now - timedelta(minutes=5)).isoformat(), 83)
+    insert_reading(conn, now.isoformat(), 74, trend="falling")
+    set_loop_state(None)
+
+    alerts = monitor.rule_low_warning(conn)
+    assert len(alerts) == 1
+    assert "no loop data" in alerts[0]["message"]
+
+
+def test_low_fallback_pattern_gate_suppresses_self_resolving_drops(conn):
+    # Seed 12 historical episodes shaped like the current drop (BG ~90,
+    # ~-30/15min) that all bottom out at 80 and recover — the pattern gate
+    # should conclude drops like this don't reach 70 and stay quiet.
+    base = datetime.now(UTC) - timedelta(days=30)
+    for ep in range(12):
+        t0 = base + timedelta(hours=3 * ep)
+        for j, bg in enumerate([110, 100, 90, 84, 80, 82, 88, 95, 103, 110]):
+            insert_reading(conn, (t0 + timedelta(minutes=5 * j)).isoformat(), bg)
+
+    now = datetime.now(UTC)
+    # No Dexcom trend string → the rate is computed from the readings (-30/15min)
+    insert_reading(conn, (now - timedelta(minutes=10)).isoformat(), 110)
+    insert_reading(conn, (now - timedelta(minutes=5)).isoformat(), 100)
+    insert_reading(conn, now.isoformat(), 90)
+    set_loop_state(None)
+
+    assert monitor.rule_low_warning(conn) == []
+
+
+def test_low_fallback_pattern_gate_allows_historically_real_drops(conn):
+    # Same shape but history says these drops DO reach the 50s → alert.
+    base = datetime.now(UTC) - timedelta(days=30)
+    for ep in range(12):
+        t0 = base + timedelta(hours=3 * ep)
+        for j, bg in enumerate([110, 100, 90, 78, 68, 58, 55, 60, 70, 82]):
+            insert_reading(conn, (t0 + timedelta(minutes=5 * j)).isoformat(), bg)
+
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=10)).isoformat(), 110)
+    insert_reading(conn, (now - timedelta(minutes=5)).isoformat(), 100)
+    insert_reading(conn, now.isoformat(), 90)
+    set_loop_state(None)
+
+    alerts = monitor.rule_low_warning(conn)
+    assert len(alerts) == 1
+    assert "Similar drops" in alerts[0]["message"]
+
+
+# ── Rapid drop: loop-blind backstop only ─────────────────────────────
+
+def _seed_rapid_drop(conn, current_bg=94):
+    now = datetime.now(UTC)
+    for j, bg in enumerate([128, 120, 112, 104, 98, current_bg]):
+        insert_reading(conn, (now - timedelta(minutes=25 - 5 * j)).isoformat(), bg)
+
+
+def test_rapid_drop_suppressed_when_loop_is_fresh(conn):
+    # This morning's 128→94 false alarm: Trio saw it and had zero-temped.
+    _seed_rapid_drop(conn)
+    set_loop_state(make_loop(bg=94.0))
+    assert monitor.rule_rapid_drop(conn) == []
+
+
+def test_rapid_drop_fires_without_loop_when_heading_low(conn):
+    _seed_rapid_drop(conn)
+    set_loop_state(None)
+    alerts = monitor.rule_rapid_drop(conn)
+    assert len(alerts) == 1
+    assert "no loop" in alerts[0]["message"].lower()
+
+
+def test_rapid_drop_ignores_high_range_drops(conn):
+    # 200→160 is a correction working, not a low emergency.
+    now = datetime.now(UTC)
+    for j, bg in enumerate([200, 192, 184, 176, 168, 160]):
+        insert_reading(conn, (now - timedelta(minutes=25 - 5 * j)).isoformat(), bg)
+    set_loop_state(None)
+    assert monitor.rule_rapid_drop(conn) == []
+
+
+def test_rapid_drop_defers_to_recent_low_warning(conn):
+    _seed_rapid_drop(conn)
+    set_loop_state(None)
+    log_alert(conn, {"rule": "LOW_WARNING", "message": "already paged"})
+    assert monitor.rule_rapid_drop(conn) == []
+
+
+# ── carbsReq reason parsing ──────────────────────────────────────────
+
+def test_parse_carbs_req_formats():
+    assert monitor.parse_carbs_req("minGuardBG 52<66 add 15g carbs req within 30m") == 15
+    assert monitor.parse_carbs_req("30 add'l carbs req w/in 45m") == 30
+    assert monitor.parse_carbs_req("carbsReq: 20") == 20
+    assert monitor.parse_carbs_req("Eventual BG 110 >= 100, insulinReq 0.24") is None
+    assert monitor.parse_carbs_req(None) is None
+
+
+# ── Loop-aware stuck-high alerting ───────────────────────────────────
+
+def seed_high(conn, minutes, bg=240, end_offset_min=0):
+    """Insert a flat high episode ending end_offset_min ago."""
+    now = datetime.now(UTC)
+    n = minutes // 5 + 1
+    for j in range(n):
+        ts = now - timedelta(minutes=end_offset_min + 5 * (n - 1 - j))
+        insert_reading(conn, ts.isoformat(), bg)
+
+
+def test_high_suppressed_when_trio_predicts_landing_in_range(conn):
+    # Jul 9 real case: BG 242 but Trio's eventual_bg said 173 — it resolved.
+    seed_high(conn, 60, bg=240)
+    set_loop_state(make_loop(bg=240.0, eventual_bg=150.0, temp_rate=3.0,
+                             pred_bgs=None))
+    assert monitor.rule_high_stuck(conn) == []
+
+
+def test_high_stuck_fires_with_trio_context(conn):
+    seed_high(conn, 60, bg=240)
+    set_loop_state(make_loop(bg=240.0, eventual_bg=210.0, temp_rate=3.0,
+                             iob=2.8, cob=0.0, pred_bgs=None,
+                             reason="insulinReq 1.4"))
+    monitor._loop_state["loop"]["insulin_req"] = 1.4
+
+    alerts = monitor.rule_high_stuck(conn)
+    assert len(alerts) == 1
+    msg = alerts[0]["message"]
+    assert "stuck" in msg.lower()
+    assert "1.4u" in msg
+    assert "210" in msg
+    assert alerts[0]["dedup_key"] is not None
+
+
+def test_high_not_yet_persisted_stays_quiet(conn):
+    seed_high(conn, 20, bg=240)
+    set_loop_state(make_loop(bg=240.0, eventual_bg=210.0, pred_bgs=None))
+    monitor._loop_state["loop"]["insulin_req"] = 1.4
+    assert monitor.rule_high_stuck(conn) == []
+
+
+def test_high_falling_is_suppressed(conn):
+    # High but dropping fast — Trio's correction is landing; don't page.
+    now = datetime.now(UTC)
+    seed_high(conn, 60, bg=250, end_offset_min=15)
+    insert_reading(conn, (now - timedelta(minutes=10)).isoformat(), 245)
+    insert_reading(conn, (now - timedelta(minutes=5)).isoformat(), 232)
+    insert_reading(conn, now.isoformat(), 220)
+    set_loop_state(make_loop(bg=220.0, eventual_bg=210.0, pred_bgs=None))
+    monitor._loop_state["loop"]["insulin_req"] = 1.0
+    assert monitor.rule_high_stuck(conn) == []
+
+
+def test_high_urgent_fires_even_with_healthy_loop(conn):
+    seed_high(conn, 45, bg=250, end_offset_min=40)   # lead-in outside urgent window
+    seed_high(conn, 35, bg=310)
+    set_loop_state(make_loop(bg=310.0, eventual_bg=120.0, pred_bgs=None))
+
+    alerts = monitor.rule_high_stuck(conn)
+    assert len(alerts) == 1
+    assert "310" in alerts[0]["message"]
+    assert "pod site" in alerts[0]["message"].lower()
+
+
+def test_high_site_suspect_when_maxed_for_hours(conn):
+    seed_high(conn, 200, bg=230)
+    set_loop_state(make_loop(
+        bg=230.0, eventual_bg=205.0, temp_rate=3.0, pred_bgs=None,
+        reason="adj. req. rate: 4.5 to maxSafeBasal: 3, insulinReq 1.9",
+    ))
+    monitor._loop_state["loop"]["insulin_req"] = 1.9
+
+    alerts = monitor.rule_high_stuck(conn)
+    assert len(alerts) == 1
+    msg = alerts[0]["message"]
+    assert "maxed" in msg.lower()
+    assert "pod" in msg.lower()
+
+
+def test_high_loop_blind_fallback(conn):
+    seed_high(conn, 90, bg=230)
+    set_loop_state(None)
+
+    alerts = monitor.rule_high_stuck(conn)
+    assert len(alerts) == 1
+    assert "no loop visibility" in alerts[0]["message"].lower()
+
+
+def test_high_new_episode_gets_fresh_escalation(conn):
+    # An alert from a long-resolved episode must not raise the level or
+    # delay the first page of a new episode (old SUSTAINED_HIGH bug).
+    old_key = (datetime.now(UTC) - timedelta(hours=6)).isoformat()
+    conn.execute(
+        "INSERT INTO alert_log (rule_name, triggered_at, message, sent, dedup_key)"
+        " VALUES (?, ?, ?, 1, ?)",
+        ("HIGH_STUCK", (datetime.now(UTC) - timedelta(hours=5)).isoformat(),
+         "old episode", old_key),
+    )
+    conn.commit()
+
+    seed_high(conn, 60, bg=240)
+    set_loop_state(make_loop(bg=240.0, eventual_bg=210.0, pred_bgs=None))
+    monitor._loop_state["loop"]["insulin_req"] = 1.4
+
+    alerts = monitor.rule_high_stuck(conn)
+    assert len(alerts) == 1
+    assert alerts[0]["dedup_key"] != old_key
+    # Level 0 message: no "first alert" backreference
+    assert "first alert" not in alerts[0]["message"]
+
+
+def test_single_sensor_dip_does_not_split_episode(conn):
+    now = datetime.now(UTC)
+    seed_high(conn, 40, bg=235, end_offset_min=25)
+    insert_reading(conn, (now - timedelta(minutes=20)).isoformat(), 178)  # one dip
+    seed_high(conn, 15, bg=235)
+    set_loop_state(make_loop(bg=235.0, eventual_bg=210.0, pred_bgs=None))
+    monitor._loop_state["loop"]["insulin_req"] = 1.0
+
+    episode = monitor.current_high_episode(conn)
+    assert episode is not None
+    assert episode["duration_min"] >= 60  # spans the dip
+
+
+def test_failed_sends_do_not_consume_escalation_slots(conn):
+    # Deploy-night bug: sent=0 rows throttled retries of undelivered alerts.
+    now = datetime.now(UTC)
+    conn.execute(
+        "INSERT INTO alert_log (rule_name, triggered_at, message, sent, dedup_key)"
+        " VALUES (?, ?, ?, 0, NULL)",
+        ("LOW_WARNING", (now - timedelta(minutes=5)).isoformat(), "never delivered"),
+    )
+    conn.commit()
+
+    insert_reading(conn, now.isoformat(), 64, trend="falling")
+    set_loop_state(make_loop(bg=64.0))
+
+    # With sent=0 counted this would wait 15 min; it must fire now instead.
+    alerts = monitor.rule_low_warning(conn)
+    assert len(alerts) == 1
+    assert "first alert" not in alerts[0]["message"]

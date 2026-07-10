@@ -19,7 +19,7 @@ Usage:
     python3 monitor.py            # Run all rules, send alerts
     python3 monitor.py --dry-run  # Print alerts without sending or logging
 
-    python3 monitor.py --snooze SUSTAINED_HIGH          # Snooze for 2hr (default)
+    python3 monitor.py --snooze HIGH_STUCK              # Snooze for 2hr (default)
     python3 monitor.py --snooze ALL --snooze-duration 90 # Snooze all for 90 min
     python3 monitor.py --snooze-status                   # List active snoozes
     python3 monitor.py --unsnooze                        # Clear all snoozes
@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import re
 import subprocess
 import sys
 from datetime import datetime, timedelta
@@ -57,7 +58,7 @@ TARGET_BG = 110         # Target BG for correction calculations
 ICR = 4                 # Insulin-to-Carb Ratio (not used in alerting, for reference)
 
 # ── Escalation schedules (minutes after previous alert) ────────────
-SCHEDULE_DEFAULT = [0, 30, 60, 60, 60]    # For highs (SUSTAINED, OVERNIGHT, POST_MEAL)
+SCHEDULE_DEFAULT = [0, 30, 60, 60, 60]    # For highs (HIGH_STUCK)
 SCHEDULE_URGENT  = [0, 15, 15, 15, 15]    # For lows (LOW_WARNING)
 
 # ── Nightscout pump/loop thresholds ─────────────────────────────────
@@ -67,6 +68,37 @@ POD_URGENT_HOURS = 78        # pod age urgent warning (pod hard-stops at 80h)
 POD_HARD_STOP_HOURS = 80
 LOOP_STALE_MINUTES = 30      # devicestatus older than this → loop-not-looping
 LIVE_BG_MAX_AGE_MINUTES = 15 # live Nightscout reading older than this is stale
+
+# ── Low-alert tiers (loop-aware) ─────────────────────────────────────
+# Backtested against 7 months of this user's CGM data (2025-12 → 2026-07):
+# the old "projected < 80" trigger went on to a real low (<70) only 24% of
+# the time, and rate-only rapid-drop alerts only 16% — the Trio loop
+# zero-temps well before carbs are needed. So low alerts now defer to
+# Trio's own predictions and only page when the loop itself can't fix it.
+LOW_URGENT_BG = 70           # below this: alert unconditionally
+LOW_NEAR_BG = 80             # near-low band where loop predictions decide
+PRED_SEVERE_BG = 60          # Trio-predicted nadir below this alerts from any BG
+LOOP_MAX_AGE_MINUTES = 15    # loop computation older than this → no loop visibility
+PRED_HORIZON_STEPS = 12      # 12 × 5-min steps = 60-min prediction window
+HIST_MIN_EPISODES = 10       # min similar past episodes to trust the pattern gate
+HIST_LOW_RATE_GATE = 0.40    # suppress if <40% of similar drops ever reached <70
+RAPID_DROP_MAX_BG = 120      # rapid-drop backstop only when already this low
+
+# ── High-alert tiers (loop-aware) ────────────────────────────────────
+# Backtested the same way: the old "avg >200 for 90 min" trigger fired
+# ~27×/month with 62% of episodes resolving on their own within 2h, and a
+# separate overnight >160 rule would have paged on 56% of all nights.
+# What separates a stuck high from one the loop fixes is persistence +
+# trend + Trio's own forecast — so the high rule pages only when the loop
+# can't fix it (see assess_high_risk).
+HIGH_TRIGGER_BG = 180        # episode = contiguous readings above this
+HIGH_AVG_BG = 200            # loop-blind fallback also requires 90-min avg above
+HIGH_PERSIST_MINUTES = 45    # backtested: cuts noise 62%→35%, misses 1/70 stuck highs
+HIGH_URGENT_BG = 300         # this high for 30+ min pages regardless of loop state
+HIGH_URGENT_MINUTES = 30
+HIGH_EVENTUAL_GATE = 180     # Trio predicts landing above this → it isn't fixing it
+HIGH_INSULIN_REQ_GATE = 0.5  # units Trio still wants before a high counts as stuck
+HIGH_SITE_SUSPECT_HOURS = 3  # this long >180 with delivery maxed → suspect the pod site
 
 # Nightscout client is optional — pump/loop rules no-op if it isn't installed
 try:
@@ -169,6 +201,178 @@ def estimate_iob(conn) -> float:
         total_iob += dose["units"] * remaining_fraction
 
     return round(total_iob, 2)
+
+
+# ── Live Trio loop state (Nightscout devicestatus) ──────────────────
+#
+# Trio uploads its full oref computation every loop cycle: net IOB
+# (including basal suspensions the bolus-only estimate can't see), COB,
+# the temp-basal decision, prediction arrays, and — when its own zero-temp
+# isn't enough to prevent a low — a carbs-required amount in the reason
+# string. Low alerting defers to this when it's fresh.
+
+_loop_state = None  # per-run cache: {"loop": dict|None}
+
+_CARBS_REQ_PATTERNS = [
+    re.compile(r"add\s+(\d+)\s*g\s+carbs", re.I),
+    re.compile(r"(\d+)\s*(?:g\s+)?add'?l\s+carbs\s+req", re.I),
+    re.compile(r"carbsReq[:\s]+(\d+)", re.I),
+]
+
+
+def fetch_loop_state() -> dict | None:
+    """Fetch Trio's latest loop computation once per run (cached).
+
+    Returns the nightscout-client loop() dict (iob/cob/eventual_bg/pred_bgs/
+    temp_rate/reason/...) or None when Nightscout isn't configured, errors,
+    or the computation is older than LOOP_MAX_AGE_MINUTES. Callers treat
+    None as "no loop visibility" and fall back to CGM-only logic.
+    """
+    global _loop_state
+    if _loop_state is not None:
+        return _loop_state["loop"]
+
+    loop = None
+    if NIGHTSCOUT_AVAILABLE and os.getenv("NIGHTSCOUT_URL"):
+        try:
+            client = NightscoutClient.from_env()
+            data = client.loop()
+            age = data.get("data_age_minutes") if data else None
+            if data and age is not None and age <= LOOP_MAX_AGE_MINUTES:
+                loop = data
+                print(f"  [LOOP] Trio loop state: IOB {data.get('iob')}u, "
+                      f"eventual {data.get('eventual_bg')}, temp {data.get('temp_rate')} U/hr "
+                      f"({age:.0f} min old)")
+            else:
+                print(f"  [LOOP] loop data stale/missing ({age} min old) — CGM-only fallback")
+        except Exception as e:
+            print(f"  [LOOP] loop state unavailable ({e}) — CGM-only fallback")
+
+    _loop_state = {"loop": loop}
+    return loop
+
+
+def parse_carbs_req(reason: str | None) -> int | None:
+    """Extract oref's carbs-required grams from a loop reason string."""
+    if not reason:
+        return None
+    for pat in _CARBS_REQ_PATTERNS:
+        m = pat.search(reason)
+        if m:
+            return int(m.group(1))
+    return None
+
+
+def loop_predicted_min(loop: dict | None) -> float | None:
+    """Trio's predicted BG minimum over the next PRED_HORIZON_STEPS×5 min.
+
+    Takes the min across all prediction scenarios (IOB/ZT/COB/UAM); falls
+    back to eventual_bg if the arrays are absent.
+    """
+    if loop is None:
+        return None
+    preds = loop.get("pred_bgs") or {}
+    mins = [min(arr[:PRED_HORIZON_STEPS]) for arr in preds.values() if arr]
+    if mins:
+        return float(min(mins))
+    return loop.get("eventual_bg")
+
+
+def describe_loop_action(loop: dict | None) -> str:
+    """Human-readable summary of what Trio is currently doing about it."""
+    if loop is None:
+        return "no loop data"
+    rate = loop.get("temp_rate")
+    if rate is None:
+        return "loop active"
+    if rate == 0:
+        return "basal suspended"
+    return f"temp basal {rate:g} U/hr"
+
+
+def current_iob(conn) -> tuple[float, str]:
+    """(IOB units, source): Trio's net IOB when fresh, else the bolus-decay
+    estimate. Trio's number accounts for suspended/temp basal — the estimate
+    can read several units high while the loop is zero-temping.
+    """
+    loop = fetch_loop_state()
+    if loop is not None and loop.get("iob") is not None:
+        return round(float(loop["iob"]), 2), "trio"
+    return estimate_iob(conn), "est"
+
+
+def effective_isf() -> float:
+    """Trio's autosens-adjusted ISF when available, else the static constant."""
+    loop = fetch_loop_state()
+    if loop is not None and loop.get("isf"):
+        return float(loop["isf"])
+    return ISF
+
+
+# ── Historical drop patterns (7 months of CGM) ──────────────────────
+
+_history_cache = None  # per-run cache: list[(datetime, int)] ascending
+
+
+def similar_drop_history(conn, bg: float, rate_per_15: float,
+                         bg_tol: float = 8, rate_tol: float = 8) -> dict | None:
+    """How drops like the current one resolved in this user's own history.
+
+    Scans all stored CGM readings for past moments with similar BG and
+    15-min rate of change, then checks the following 60 min for a real low.
+    Episodes closer than 45 min apart count once; the last 2 hours are
+    excluded (that's the episode being evaluated). Returns None when there
+    are fewer than HIST_MIN_EPISODES matches to learn from.
+    """
+    global _history_cache
+    if _history_cache is None:
+        rows = conn.execute("""
+            SELECT timestamp, glucose_mg_dl FROM glucose_readings
+            ORDER BY timestamp ASC
+        """).fetchall()
+        _history_cache = [(parse_ts_utc(r["timestamp"]), r["glucose_mg_dl"]) for r in rows]
+
+    readings = _history_cache
+    now = utc_now()
+    episodes = 0
+    went_low = 0
+    nadirs = []
+    last_match = None
+
+    for i in range(2, len(readings) - 3):
+        ts, g = readings[i]
+        if (now - ts).total_seconds() < 2 * 3600:
+            continue
+        t_old, g_old = readings[i - 2]
+        span_min = (ts - t_old).total_seconds() / 60
+        if not (0 < span_min <= 20):
+            continue
+        rate = (g - g_old) / span_min * 15
+        if abs(g - bg) > bg_tol or abs(rate - rate_per_15) > rate_tol:
+            continue
+        if last_match is not None and (ts - last_match).total_seconds() < 45 * 60:
+            continue
+        last_match = ts
+        future = [b for (t, b) in readings[i + 1:i + 40]
+                  if (t - ts).total_seconds() <= 3600]
+        if not future:
+            continue
+        episodes += 1
+        nadir = min(future)
+        nadirs.append(nadir)
+        if nadir < LOW_URGENT_BG:
+            went_low += 1
+
+    if episodes < HIST_MIN_EPISODES:
+        return None
+
+    nadirs.sort()
+    return {
+        "episodes": episodes,
+        "went_low": went_low,
+        "low_rate": went_low / episodes,
+        "median_nadir": nadirs[len(nadirs) // 2],
+    }
 
 
 # ── Live current BG (Nightscout) ────────────────────────────────────
@@ -329,35 +533,6 @@ def suggested_correction(current_bg: float, target: float = TARGET_BG,
     return round(adjusted, 1)
 
 
-def build_context_line(conn, iob: float, trend: dict) -> str:
-    """Build a context line: IOB + trend + last correction."""
-    parts = []
-
-    # IOB
-    if iob > 0:
-        est_drop = round(iob * ISF)
-        parts.append(f"IOB ~{iob}u (est. drop ~{est_drop} mg/dL)")
-    else:
-        parts.append("IOB: no recent doses")
-
-    # Trend
-    parts.append(f"Trend: {trend['arrow']} {trend['description']}")
-
-    # Last correction
-    cutoff = (utc_now() - timedelta(hours=6)).isoformat()
-    last_corr = conn.execute("""
-        SELECT timestamp, units FROM insulin_doses
-        WHERE timestamp > ? AND type = 'correction'
-        ORDER BY timestamp DESC LIMIT 1
-    """, (cutoff,)).fetchone()
-
-    if last_corr:
-        corr_time = fmt_time_ny(last_corr["timestamp"])
-        parts.append(f"Last correction: {last_corr['units']}u at {corr_time}")
-
-    return " | ".join(parts)
-
-
 def get_alert_history(conn, rule_name: str, hours: float = 6.0,
                       dedup_key: str = None) -> list[dict]:
     """Return all alerts for this rule in the last N hours, ordered by triggered_at ASC.
@@ -366,16 +541,18 @@ def get_alert_history(conn, rule_name: str, hours: float = 6.0,
     """
     cutoff = (utc_now() - timedelta(hours=hours)).isoformat()
 
+    # sent = 1 only: an alert that failed to deliver must not consume an
+    # escalation slot — excluding it here makes the next 5-min run retry.
     if dedup_key is not None:
         rows = conn.execute("""
             SELECT triggered_at, message, dedup_key FROM alert_log
-            WHERE rule_name = ? AND triggered_at > ? AND dedup_key = ?
+            WHERE rule_name = ? AND triggered_at > ? AND dedup_key = ? AND sent = 1
             ORDER BY triggered_at ASC
         """, (rule_name, cutoff, dedup_key)).fetchall()
     else:
         rows = conn.execute("""
             SELECT triggered_at, message, dedup_key FROM alert_log
-            WHERE rule_name = ? AND triggered_at > ?
+            WHERE rule_name = ? AND triggered_at > ? AND sent = 1
             ORDER BY triggered_at ASC
         """, (rule_name, cutoff)).fetchall()
 
@@ -417,77 +594,6 @@ def is_snoozed(conn, rule_name: str) -> bool:
         LIMIT 1
     """, (rule_name, now_iso)).fetchone()
     return row is not None
-
-
-def get_similar_meal_outcomes(conn, carbs_g, tolerance=15) -> dict | None:
-    """Find average spike and correction for meals with similar carbs.
-
-    Returns dict with avg_spike, avg_correction_units, sample_count, or None.
-    """
-    if carbs_g is None or carbs_g <= 0:
-        return None
-
-    low = carbs_g - tolerance
-    high = carbs_g + tolerance
-
-    # Find meals with similar carbs (older than 6 hours to exclude current episode)
-    cutoff = (utc_now() - timedelta(hours=6)).isoformat()
-    meals = conn.execute("""
-        SELECT id, timestamp, carbs_g FROM meals
-        WHERE carbs_g BETWEEN ? AND ?
-          AND timestamp < ?
-        ORDER BY timestamp DESC
-        LIMIT 20
-    """, (low, high, cutoff)).fetchall()
-
-    if not meals:
-        return None
-
-    spikes = []
-    corrections = []
-
-    for meal in meals:
-        meal_ts = meal["timestamp"]
-
-        # Get baseline BG (avg 30 min before meal)
-        baseline_row = conn.execute("""
-            SELECT AVG(glucose_mg_dl) as avg_bg FROM glucose_readings
-            WHERE timestamp BETWEEN datetime(?, '-30 minutes') AND ?
-        """, (meal_ts, meal_ts)).fetchone()
-
-        if not baseline_row or baseline_row["avg_bg"] is None:
-            continue
-
-        baseline = baseline_row["avg_bg"]
-
-        # Get peak BG 30-120 min after meal
-        peak_row = conn.execute("""
-            SELECT MAX(glucose_mg_dl) as peak_bg FROM glucose_readings
-            WHERE timestamp BETWEEN datetime(?, '+30 minutes')
-                                AND datetime(?, '+120 minutes')
-        """, (meal_ts, meal_ts)).fetchone()
-
-        if peak_row and peak_row["peak_bg"] is not None:
-            spikes.append(peak_row["peak_bg"] - baseline)
-
-        # Find correction bolus within 2 hours of meal
-        corr_row = conn.execute("""
-            SELECT SUM(units) as total_units FROM insulin_doses
-            WHERE timestamp BETWEEN ? AND datetime(?, '+120 minutes')
-              AND type = 'correction'
-        """, (meal_ts, meal_ts)).fetchone()
-
-        if corr_row and corr_row["total_units"] is not None:
-            corrections.append(corr_row["total_units"])
-
-    if not spikes:
-        return None
-
-    return {
-        "avg_spike": round(sum(spikes) / len(spikes), 0),
-        "avg_correction_units": round(sum(corrections) / len(corrections), 1) if corrections else None,
-        "sample_count": len(spikes),
-    }
 
 
 # ── Table management ───────────────────────────────────────────────
@@ -535,7 +641,7 @@ def was_recently_alerted(conn, rule_name: str, hours: float = 2.0) -> bool:
     cutoff = (utc_now() - timedelta(hours=hours)).isoformat()
     row = conn.execute("""
         SELECT id FROM alert_log
-        WHERE rule_name = ? AND triggered_at > ?
+        WHERE rule_name = ? AND triggered_at > ? AND sent = 1
         LIMIT 1
     """, (rule_name, cutoff)).fetchone()
     return row is not None
@@ -554,212 +660,240 @@ def send_imsg(message: str):
 
 # ── Rule implementations ───────────────────────────────────────────
 
-def rule_post_meal_spike(conn) -> list[dict]:
-    """Rule 1: Detect post-meal BG spikes with progressive escalation."""
-    alerts = []
-    cutoff = (utc_now() - timedelta(hours=6)).isoformat()
-
-    meals = conn.execute("""
-        SELECT id, timestamp, description, carbs_g
-        FROM meals WHERE timestamp > ?
-        ORDER BY timestamp DESC
-    """, (cutoff,)).fetchall()
-
-    iob = estimate_iob(conn)
-    trend = get_bg_trend(conn)
-
-    for meal in meals:
-        meal_ts = meal["timestamp"]
-        carbs = meal["carbs_g"] or 0
-
-        # Stop escalating after 4 hours post-meal
-        meal_dt = datetime.fromisoformat(meal_ts)
-        if meal_dt.tzinfo is None:
-            meal_dt = meal_dt.replace(tzinfo=UTC)
-        hours_since_meal = (utc_now() - meal_dt).total_seconds() / 3600
-        if hours_since_meal > 4:
-            continue
-
-        # Get escalation history for this specific meal
-        history = get_alert_history(conn, "POST_MEAL_SPIKE", hours=4.0, dedup_key=meal_ts)
-        should_fire, level = should_escalate(history, SCHEDULE_DEFAULT)
-
-        if not should_fire:
-            continue
-
-        # Baseline: avg BG in 30 min before meal
-        baseline_rows = conn.execute("""
-            SELECT AVG(glucose_mg_dl) as avg_bg
-            FROM glucose_readings
-            WHERE timestamp BETWEEN datetime(?, '-30 minutes') AND ?
-        """, (meal_ts, meal_ts)).fetchone()
-
-        baseline = baseline_rows["avg_bg"] if baseline_rows and baseline_rows["avg_bg"] else None
-        if baseline is None:
-            continue
-
-        # Peak: max BG 30–120 min after meal
-        peak_row = conn.execute("""
-            SELECT MAX(glucose_mg_dl) as peak_bg,
-                   timestamp as peak_ts
-            FROM glucose_readings
-            WHERE timestamp BETWEEN datetime(?, '+30 minutes')
-                                AND datetime(?, '+120 minutes')
-        """, (meal_ts, meal_ts)).fetchone()
-
-        if peak_row is None or peak_row["peak_bg"] is None:
-            continue
-
-        peak_bg = peak_row["peak_bg"]
-        peak_ts = peak_row["peak_ts"]
-        rise = peak_bg - baseline
-
-        if rise <= 60:
-            continue
-
-        # Get current BG (live Nightscout when fresher, else newest SQLite row)
-        current_row = get_current_reading(conn)
-        if current_row is None:
-            continue
-
-        current_bg = current_row["glucose_mg_dl"]
-        current_time = fmt_time_ny(current_row["timestamp"])
-
-        # Guard: only escalate if BG still >160
-        if level > 0 and current_bg <= 160:
-            continue
-
-        desc = (meal["description"] or "meal")[:20]
-        est_drop = round(iob * ISF)
-
-        if level == 0:
-            arrow = trend["arrow"]
-            peak_time = fmt_time_ny(peak_ts) if peak_ts else "?"
-            iob_note = (f"IOB ~{iob}u (est. drop ~{est_drop} mg/dL) — may come down on its own."
-                        if iob > 0 else "IOB: no recent doses.")
-            msg = (
-                f"\U0001f4c8 Post-meal spike: +{rise:.0f} mg/dL after {desc} "
-                f"({carbs:.0f}g carbs). Peak {peak_bg} at {peak_time}. "
-                f"Current: {current_bg}{arrow} ({current_time})\n"
-                f"{iob_note}"
-            )
-        elif level == 1:
-            arrow = trend["arrow"]
-            iob_note = (f"IOB ~{iob}u (est. drop ~{est_drop} mg/dL). Watching — may still need correction."
-                        if iob > 0 else "IOB: no recent doses. May need correction.")
-            msg = (
-                f"\U0001f4c8 Still elevated after {desc} ({carbs:.0f}g carbs, +{rise:.0f} spike). "
-                f"Current: {current_bg}{arrow} ({current_time}).\n"
-                f"{iob_note}"
-            )
-        else:
-            # Level 2+: include historical context
-            mins_post = int(hours_since_meal * 60)
-            iob_note = (f"IOB ~{iob}u (est. drop ~{est_drop} mg/dL)."
-                        if iob > 0 else "IOB: no recent doses.")
-            msg = (
-                f"\U0001f4c8 Persistent high after {desc} ({carbs:.0f}g carbs). "
-                f"Current: {current_bg}{trend['arrow']} ({current_time}), {mins_post} min post-meal.\n"
-                f"{iob_note}"
-            )
-            # Add historical meal pattern if available
-            similar = get_similar_meal_outcomes(conn, carbs)
-            if similar and similar["sample_count"] >= 2:
-                msg += f"\nSimilar meals averaged +{similar['avg_spike']:.0f} mg/dL spike"
-                if similar["avg_correction_units"]:
-                    msg += f"; correction of {similar['avg_correction_units']}u typically helped"
-                msg += f" ({similar['sample_count']} meals)."
-
-        alerts.append({
-            "rule": "POST_MEAL_SPIKE",
-            "message": msg,
-            "dedup_key": meal_ts,
-        })
-
-    return alerts
+_MAX_BASAL_RE = re.compile(r"maxSafeBasal:?\s*([\d.]+)", re.I)
 
 
-def rule_sustained_high(conn) -> list[dict]:
-    """Rule 2: Sustained high — avg BG > 200 for 90 min and current > 180.
+def loop_delivery_maxed(loop: dict | None) -> bool:
+    """True when Trio's temp basal is pinned at its safety cap — the reason
+    string cites maxSafeBasal when the requested rate was clamped."""
+    if loop is None:
+        return False
+    m = _MAX_BASAL_RE.search(loop.get("reason") or "")
+    if not m:
+        return False
+    temp = loop.get("temp_rate")
+    return temp is not None and temp >= float(m.group(1)) - 0.05
 
-    Uses progressive escalation with SCHEDULE_DEFAULT.
+
+def current_high_episode(conn) -> dict | None:
+    """The in-progress high episode: contiguous readings above HIGH_TRIGGER_BG.
+
+    Walks recent readings newest-first; the episode is broken only by two
+    consecutive readings at/below the threshold, so a single sensor dip
+    doesn't reset the escalation clock. The episode's start timestamp is the
+    escalation dedup_key — a new high never inherits a resolved episode's
+    escalation level. Returns {"start_ts", "duration_min", "avg_bg"} or None
+    when the current BG isn't above the threshold.
     """
-    cutoff = (utc_now() - timedelta(minutes=90)).isoformat()
-    avg_row = conn.execute("""
-        SELECT AVG(glucose_mg_dl) as avg_bg, COUNT(*) as cnt
+    current = get_current_reading(conn)
+    if current is None or current["glucose_mg_dl"] <= HIGH_TRIGGER_BG:
+        return None
+
+    cutoff = (utc_now() - timedelta(hours=8)).isoformat()
+    readings = [dict(r) for r in conn.execute("""
+        SELECT glucose_mg_dl, timestamp FROM glucose_readings
+        WHERE timestamp > ?
+        ORDER BY timestamp DESC
+    """, (cutoff,)).fetchall()]
+
+    if not readings or parse_ts_utc(current["timestamp"]) > parse_ts_utc(readings[0]["timestamp"]):
+        readings.insert(0, {"glucose_mg_dl": current["glucose_mg_dl"],
+                            "timestamp": current["timestamp"]})
+
+    episode = []
+    low_streak = 0
+    for r in readings:
+        if r["glucose_mg_dl"] > HIGH_TRIGGER_BG:
+            low_streak = 0
+            episode.append(r)
+        else:
+            low_streak += 1
+            if low_streak >= 2:
+                break
+
+    if not episode:
+        return None
+
+    start_ts = episode[-1]["timestamp"]
+    duration_min = (parse_ts_utc(episode[0]["timestamp"])
+                    - parse_ts_utc(start_ts)).total_seconds() / 60
+    avg_bg = sum(r["glucose_mg_dl"] for r in episode) / len(episode)
+    return {"start_ts": start_ts, "duration_min": duration_min,
+            "avg_bg": avg_bg}
+
+
+def assess_high_risk(conn, episode: dict, current_bg: float,
+                     rate_per_15: float) -> dict | None:
+    """Decide whether the in-progress high warrants an alert.
+
+    Tiers (first match wins):
+      URGENT       — BG ≥ HIGH_URGENT_BG for HIGH_URGENT_MINUTES. A high this
+                     severe can mean a failed pod site, where even Trio's
+                     predictions can't be trusted; pages regardless of loop.
+      SITE_SUSPECT — hours above HIGH_TRIGGER_BG with delivery pinned at
+                     Trio's safety cap and Trio still predicting a high
+                     landing: insulin isn't winning — bad site or missed bolus.
+      STUCK        — persisted ≥ HIGH_PERSIST_MINUTES, not falling, and
+                     Trio's own forecast lands above HIGH_EVENTUAL_GATE while
+                     it still wants ≥ HIGH_INSULIN_REQ_GATE units.
+      LOOP_BLIND   — no fresh loop data: CGM-only fallback (persisted, not
+                     falling, 90-min avg > HIGH_AVG_BG).
+
+    Returns None when no alert should fire — notably whenever Trio's
+    eventual_bg says the correction it's already running lands in range
+    (backtested: 62% of "avg >200" episodes resolve within 2h on their own).
+    """
+    # URGENT: severe high sustained for HIGH_URGENT_MINUTES
+    cutoff = (utc_now() - timedelta(minutes=HIGH_URGENT_MINUTES + 5)).isoformat()
+    row = conn.execute("""
+        SELECT MIN(glucose_mg_dl) AS min_bg, COUNT(*) AS cnt
         FROM glucose_readings WHERE timestamp > ?
     """, (cutoff,)).fetchone()
+    if (current_bg >= HIGH_URGENT_BG and row is not None and row["cnt"] >= 4
+            and row["min_bg"] is not None and row["min_bg"] >= HIGH_URGENT_BG):
+        return {"tier": "URGENT", "loop": fetch_loop_state()}
 
-    if avg_row is None or avg_row["cnt"] < 6:
+    falling = rate_per_15 < -5
+    loop = fetch_loop_state()
+
+    if loop is not None:
+        eventual = loop.get("eventual_bg")
+        insulin_req = loop.get("insulin_req") or 0.0
+        if (episode["duration_min"] >= HIGH_SITE_SUSPECT_HOURS * 60
+                and loop_delivery_maxed(loop)
+                and (eventual is None or eventual > HIGH_EVENTUAL_GATE)):
+            return {"tier": "SITE_SUSPECT", "loop": loop}
+        if (episode["duration_min"] >= HIGH_PERSIST_MINUTES and not falling
+                and eventual is not None and eventual > HIGH_EVENTUAL_GATE
+                and insulin_req >= HIGH_INSULIN_REQ_GATE):
+            return {"tier": "STUCK", "loop": loop}
+        return None  # Trio's correction is on track to land in range
+
+    if episode["duration_min"] >= HIGH_PERSIST_MINUTES and not falling:
+        cutoff90 = (utc_now() - timedelta(minutes=90)).isoformat()
+        avg_row = conn.execute("""
+            SELECT AVG(glucose_mg_dl) AS avg_bg, COUNT(*) AS cnt
+            FROM glucose_readings WHERE timestamp > ?
+        """, (cutoff90,)).fetchone()
+        if (avg_row is not None and avg_row["cnt"] >= 6
+                and avg_row["avg_bg"] is not None
+                and avg_row["avg_bg"] > HIGH_AVG_BG):
+            return {"tier": "LOOP_BLIND", "loop": None}
+
+    return None
+
+
+def rule_high_stuck(conn) -> list[dict]:
+    """Rule 1: Stuck high — loop-aware replacement for the old sustained-high,
+    overnight-high, and post-meal-spike rules.
+
+    One episode = contiguous time above HIGH_TRIGGER_BG (current_high_episode);
+    the episode start is the escalation dedup_key. Follow-ups re-run the full
+    assessment, so escalations stop the moment Trio regains the upper hand.
+    Overnight gets no special lower threshold: being woken is only worth it
+    when the loop can't fix the high, which is exactly what the tiers encode.
+    """
+    trend = get_bg_trend(conn)
+    if trend["current_bg"] is None:
+        return []
+    current_bg = trend["current_bg"]
+
+    episode = current_high_episode(conn)
+    if episode is None:
         return []
 
-    avg_bg = avg_row["avg_bg"]
-
-    current_row = get_current_reading(conn)
-
-    if current_row is None:
+    assessment = assess_high_risk(conn, episode, current_bg, trend["rate_per_15"])
+    if assessment is None:
         return []
 
-    current_bg = current_row["glucose_mg_dl"]
-    current_time = fmt_time_ny(current_row["timestamp"])
-
-    if avg_bg <= 200 or current_bg <= 180:
-        return []
-
-    # Progressive escalation
-    history = get_alert_history(conn, "SUSTAINED_HIGH", hours=6.0)
+    history = get_alert_history(conn, "HIGH_STUCK", hours=12.0,
+                                dedup_key=episode["start_ts"])
     should_fire, level = should_escalate(history, SCHEDULE_DEFAULT)
-
     if not should_fire:
         return []
 
-    iob = estimate_iob(conn)
-    trend = get_bg_trend(conn)
-    est_drop = round(iob * ISF)
+    current_time = fmt_time_ny(trend["current_ts"])
+    arrow = trend["arrow"]
+    dur = episode["duration_min"]
+    dur_note = f"{dur / 60:.1f}h" if dur >= 90 else f"{dur:.0f} min"
+    since = ""
+    if level > 0 and history:
+        since = f" — first alert {fmt_time_ny(history[0]['triggered_at'])}"
 
-    if level == 0:
-        iob_note = (f"IOB ~{iob}u (est. drop ~{est_drop} mg/dL)."
-                    if iob > 0 else "IOB: no recent doses.")
+    tier = assessment["tier"]
+    loop = assessment.get("loop")
+
+    trio_bits = []
+    if loop is not None:
+        if loop.get("temp_rate") is not None:
+            maxed = " (maxed)" if loop_delivery_maxed(loop) else ""
+            trio_bits.append(f"temp {loop['temp_rate']:g} U/hr{maxed}")
+        if loop.get("iob") is not None:
+            trio_bits.append(f"IOB {loop['iob']:.1f}u net")
+        if loop.get("cob"):
+            trio_bits.append(f"COB {loop['cob']:.0f}g")
+        if loop.get("eventual_bg") is not None:
+            trio_bits.append(f"predicts ~{loop['eventual_bg']:.0f}")
+    trio_note = ("Trio: " + ", ".join(trio_bits) + ".") if trio_bits else "No loop data."
+
+    if tier == "URGENT":
         msg = (
-            f"\u26a0\ufe0f Sustained high: avg {avg_bg:.0f} over 90 min, "
-            f"currently {current_bg} ({current_time}). Consider correction.\n"
-            f"{iob_note}"
+            f"\U0001f6a8 BG {current_bg:.0f}{arrow} — at/above {HIGH_URGENT_BG} for "
+            f"{HIGH_URGENT_MINUTES}+ min ({current_time}){since}. {trio_note}\n"
+            f"Check the pod site — a manual correction may be needed."
         )
-    elif level == 1:
-        iob_note = (f"IOB ~{iob}u (est. drop ~{est_drop} mg/dL)."
-                    if iob > 0 else "IOB: no recent doses.")
-        first_alert = history[0]["triggered_at"]
-        mins_since = int((utc_now() - datetime.fromisoformat(
-            first_alert if "+" in first_alert or first_alert.endswith("Z")
-            else first_alert + "+00:00"
-        ).replace(tzinfo=None).replace(tzinfo=UTC)).total_seconds() / 60)
+    elif tier == "SITE_SUSPECT":
         msg = (
-            f"\u26a0\ufe0f Still high: avg {avg_bg:.0f}, currently {current_bg}{trend['arrow']} "
-            f"({current_time}), {mins_since} min and counting.\n"
-            f"{iob_note}"
+            f"\U0001f6a8 High for {dur_note} and Trio is maxed out: BG {current_bg:.0f}{arrow} "
+            f"(avg {episode['avg_bg']:.0f}) ({current_time}){since}. {trio_note}\n"
+            f"Suspect pod site or missed meal bolus — consider a pod change or manual injection."
         )
-    else:
-        # Level 2+: include correction suggestion
-        corr = suggested_correction(current_bg, iob=iob)
-        if iob > 0:
-            iob_note = f"IOB ~{iob}u."
-        else:
-            iob_note = "IOB: no recent doses."
+    elif tier == "STUCK":
+        insulin_req = (loop or {}).get("insulin_req") or 0.0
+        cob = (loop or {}).get("cob") or 0.0
+        extras = []
+        if insulin_req >= HIGH_INSULIN_REQ_GATE:
+            extras.append(f"Manual bolus of ~{insulin_req:.1f}u would cover what Trio still wants.")
+        if cob > 0:
+            extras.append(f"{cob:.0f}g COB still absorbing — possibly an under-bolused meal.")
         msg = (
-            f"\u26a0\ufe0f Still high: avg {avg_bg:.0f}, currently {current_bg}{trend['arrow']} "
-            f"({current_time}).\n"
-            f"{iob_note} Suggested correction: ~{corr}u (BG {current_bg}, target {TARGET_BG}, ISF {ISF})."
+            f"\u26a0\ufe0f High and stuck: {current_bg:.0f}{arrow} for {dur_note} "
+            f"(avg {episode['avg_bg']:.0f}) ({current_time}){since}. {trio_note}\n"
+            f"{' '.join(extras)}".rstrip()
+        )
+    else:  # LOOP_BLIND
+        iob, _ = current_iob(conn)
+        msg = (
+            f"\u26a0\ufe0f Sustained high with no loop visibility: BG {current_bg:.0f}{arrow} "
+            f"for {dur_note} (avg {episode['avg_bg']:.0f}) ({current_time}){since}. "
+            f"IOB {iob}u (est.).\n"
+            f"Can't confirm Trio is correcting — check the loop and consider a manual correction."
         )
 
-    return [{"rule": "SUSTAINED_HIGH", "message": msg}]
+    return [{"rule": "HIGH_STUCK", "message": msg, "dedup_key": episode["start_ts"]}]
 
 
 def rule_rapid_drop(conn) -> list[dict]:
-    """Rule 3: Rapid drop — BG dropped > 30 in last 30 min.
+    """Rule 3: Rapid drop — CGM-only backstop for when the loop is blind.
 
-    Keeps simple 2hr cooldown (no progressive escalation). Adds IOB context.
+    When Trio is looping with fresh data, its predictions own low alerting
+    (rule_low_warning defers to them) and it reacts to a fast drop faster
+    than a human can — backtesting 7 months of CGM showed rate-only drop
+    alerts reached a real low just 16% of the time. So this fires ONLY when
+    there is no fresh loop computation (Nightscout down / loop stale), BG
+    dropped > 30 in ≤ 30 min, and BG is already below RAPID_DROP_MAX_BG
+    (a fast drop from 200 isn't a low emergency).
+
+    Keeps simple 2hr cooldown (no progressive escalation). Skipped if
+    LOW_WARNING alerted in the last 30 min — one alert per event.
     """
+    if fetch_loop_state() is not None:
+        return []
+
     if was_recently_alerted(conn, "RAPID_DROP"):
+        return []
+
+    if was_recently_alerted(conn, "LOW_WARNING", hours=0.5):
         return []
 
     readings = [dict(r) for r in conn.execute("""
@@ -793,22 +927,22 @@ def rule_rapid_drop(conn) -> list[dict]:
         return []
 
     drop = oldest_bg - current_bg
-    if drop > 30:
+    if drop > 30 and current_bg < RAPID_DROP_MAX_BG:
         rate = drop / span_min * 60  # per hour
         bg_time = fmt_time_ny(current_ts)
 
         iob = estimate_iob(conn)
-        est_drop = round(iob * ISF)
+        est_drop = round(iob * effective_isf())
 
         if iob > 0:
-            iob_note = f"IOB ~{iob}u (est. further drop ~{est_drop} mg/dL). Consider fast carbs now."
+            iob_note = f"IOB ~{iob}u est. (no loop data \u2014 est. further drop ~{est_drop} mg/dL)."
         else:
-            iob_note = "IOB: no recent doses."
+            iob_note = "IOB: no recent doses on record (no loop data)."
 
         msg = (
-            f"\u26a0\ufe0f Rapid drop: {oldest_bg}\u2192{current_bg} "
+            f"\u26a0\ufe0f Rapid drop with no loop visibility: {oldest_bg}\u2192{current_bg} "
             f"in {span_min:.0f} min ({rate:.0f}/hr) as of {bg_time}.\n"
-            f"{iob_note}"
+            f"{iob_note} Watch closely \u2014 fast carbs if it keeps falling."
         )
         return [{"rule": "RAPID_DROP", "message": msg}]
     return []
@@ -861,119 +995,68 @@ def rule_pre_workout_low_risk(conn) -> list[dict]:
     return []
 
 
-def rule_overnight_high(conn) -> list[dict]:
-    """Rule 5: Overnight high — BG > 160 for > 60 min between 23:00-07:00 NY.
+def assess_low_risk(conn, current_bg: float, rate_per_15: float,
+                    description: str) -> dict | None:
+    """Decide whether the current situation warrants a low alert.
 
-    Uses progressive escalation with SCHEDULE_DEFAULT.
+    Tiers (first match wins):
+      URGENT    — BG already < LOW_URGENT_BG: always alert.
+      CARBS_REQ — Trio's own algorithm says carbs are required (its
+                  zero-temp isn't enough). The canonical "you must act" signal.
+      PREDICTED — near-low (BG < LOW_NEAR_BG) with Trio predicting < 70
+                  within the hour, or a predicted nadir < PRED_SEVERE_BG
+                  from any BG.
+      FALLBACK  — no fresh loop data: CGM-only projection, gated by how
+                  similar drops resolved in this user's own history.
+
+    Returns None when no alert should fire — notably whenever Trio has
+    fresh predictions showing the dip resolves on its own: the loop cuts
+    basal well before carbs are needed, and backtesting 7 months of this
+    user's CGM shows those moments self-resolve ~3 out of 4 times.
     """
-    now_ny = ny_now()
-    hour = now_ny.hour
+    if current_bg < LOW_URGENT_BG:
+        return {"tier": "URGENT", "loop": fetch_loop_state()}
 
-    # Only run between 23:00 and 07:00 NY time
-    if 7 <= hour < 23:
-        return []
+    loop = fetch_loop_state()
+    if loop is not None:
+        carbs_req = parse_carbs_req(loop.get("reason"))
+        pred_min = loop_predicted_min(loop)
+        if carbs_req:
+            return {"tier": "CARBS_REQ", "carbs_req": carbs_req,
+                    "pred_min": pred_min, "loop": loop}
+        if pred_min is not None:
+            if (current_bg < LOW_NEAR_BG and pred_min < LOW_URGENT_BG) \
+                    or pred_min < PRED_SEVERE_BG:
+                return {"tier": "PREDICTED", "pred_min": pred_min, "loop": loop}
+            return None  # Trio sees the drop and predicts self-resolution
+        # loop fresh but no predictions → fall through to CGM-only logic
 
-    # Look at the last 90 min of readings
-    cutoff = (utc_now() - timedelta(minutes=90)).isoformat()
-    readings = conn.execute("""
-        SELECT glucose_mg_dl, timestamp FROM glucose_readings
-        WHERE timestamp > ?
-        ORDER BY timestamp ASC
-    """, (cutoff,)).fetchall()
+    falling = description == "falling"
+    projected = current_bg + rate_per_15
+    near_low_falling = current_bg < LOW_NEAR_BG and falling
+    projected_low = falling and projected < LOW_URGENT_BG
 
-    if len(readings) < 6:
-        return []
+    if not (near_low_falling or projected_low):
+        return None
 
-    # Count consecutive minutes above 160
-    high_start = None
-    max_high_duration = 0
+    hist = similar_drop_history(conn, current_bg, rate_per_15)
+    # Pattern gate applies only above the near-low band: a projected low
+    # from BG >= 80 is suppressed when this user's own history says drops
+    # like this almost never reach 70.
+    if (hist is not None and current_bg >= LOW_NEAR_BG
+            and hist["low_rate"] < HIST_LOW_RATE_GATE):
+        return None
 
-    for r in readings:
-        bg = r["glucose_mg_dl"]
-        ts = r["timestamp"]
-        if bg > 160:
-            if high_start is None:
-                high_start = ts
-        else:
-            if high_start is not None:
-                try:
-                    dur = (datetime.fromisoformat(ts) - datetime.fromisoformat(high_start)).total_seconds() / 60
-                    max_high_duration = max(max_high_duration, dur)
-                except (ValueError, TypeError):
-                    pass
-                high_start = None
-
-    if high_start is not None:
-        try:
-            dur = (datetime.fromisoformat(readings[-1]["timestamp"]) - datetime.fromisoformat(high_start)).total_seconds() / 60
-            max_high_duration = max(max_high_duration, dur)
-        except (ValueError, TypeError):
-            pass
-
-    if max_high_duration <= 60:
-        return []
-
-    # Get current BG
-    current_row = get_current_reading(conn)
-
-    if current_row is None:
-        return []
-
-    current_bg = current_row["glucose_mg_dl"]
-    current_time = fmt_time_ny(current_row["timestamp"])
-
-    # Guard: only alert/escalate if still >160
-    if current_bg <= 160:
-        return []
-
-    # Progressive escalation
-    history = get_alert_history(conn, "OVERNIGHT_HIGH", hours=6.0)
-    should_fire, level = should_escalate(history, SCHEDULE_DEFAULT)
-
-    if not should_fire:
-        return []
-
-    high_readings = [r["glucose_mg_dl"] for r in readings if r["glucose_mg_dl"] > 160]
-    avg_high = sum(high_readings) / len(high_readings) if high_readings else 0
-
-    iob = estimate_iob(conn)
-    est_drop = round(iob * ISF)
-
-    if level == 0:
-        iob_note = (f"IOB ~{iob}u (est. drop ~{est_drop} mg/dL)."
-                    if iob > 0 else "IOB: no recent doses.")
-        msg = (
-            f"\U0001f319 Overnight high: avg {avg_high:.0f} for {max_high_duration:.0f} min. "
-            f"Currently {current_bg}{get_bg_trend(conn)['arrow']} ({current_time}).\n"
-            f"{iob_note}"
-        )
-    else:
-        # Level 1+: include correction suggestion
-        corr = suggested_correction(current_bg, iob=iob)
-        iob_note = (f"IOB ~{iob}u." if iob > 0 else "IOB: no recent doses.")
-        msg = (
-            f"\U0001f319 Overnight high: avg {avg_high:.0f} for {max_high_duration:.0f} min. "
-            f"Currently {current_bg}{get_bg_trend(conn)['arrow']} ({current_time}).\n"
-            f"{iob_note} Small correction of ~{corr}u would target {TARGET_BG}."
-        )
-
-    return [{"rule": "OVERNIGHT_HIGH", "message": msg}]
+    return {"tier": "FALLBACK", "hist": hist, "loop": None}
 
 
 def rule_low_warning(conn) -> list[dict]:
-    """Rule 6: Low warning — catches gradual lows that RAPID_DROP misses.
+    """Rule 6: Low warning — loop-aware and pattern-gated.
 
-    Fires when:
-      (a) Projected BG in 15 min < 80 (i.e. current_bg + rate < 80), OR
-      (b) BG < 90 AND IOB > 0.5u AND actively falling (rate < -5/15min), OR
-      (c) BG < 80 (already below threshold, regardless of trend)
-
-    Does NOT fire when:
-      - BG >= 80 AND trend is stable or rising — covers normal overnight
-        fluctuation patterns like 80→88→90→82→90→95.
-
-    Follow-up alerts (level > 0) re-verify conditions before firing.
-    If BG has stabilized (>= 85 and stable/rising), follow-ups are suppressed.
+    Defers to Trio's live predictions (assess_low_risk); when the loop is
+    healthy and predicts the dip resolves, no alert is sent. Follow-up
+    alerts re-run the full assessment, so escalations stop the moment the
+    situation no longer qualifies.
 
     Uses SCHEDULE_URGENT (15-min cadence) since lows are time-sensitive.
     """
@@ -983,74 +1066,60 @@ def rule_low_warning(conn) -> list[dict]:
         return []
 
     current_bg = trend["current_bg"]
-    current_ts = trend["current_ts"]
     rate = trend["rate_per_15"]
-    description = trend["description"]  # "stable", "rising", or "falling"
 
-    iob = estimate_iob(conn)
-    est_drop = round(iob * ISF)
-
-    # Suppression: BG >= 80 and stable/rising → normal fluctuation, don't alert
-    if current_bg >= 80 and description in ("stable", "rising"):
-        return []
-
-    # Check trigger conditions
-    projected_bg = current_bg + rate   # estimated BG in ~15 min
-    condition_a = projected_bg < 80    # projected to cross below 80 in 15 min
-    condition_b = current_bg < 90 and iob > 0.5 and rate < -5  # near-low + IOB + falling
-    condition_c = current_bg < 80      # already below 80
-
-    if not (condition_a or condition_b or condition_c):
+    assessment = assess_low_risk(conn, current_bg, rate, trend["description"])
+    if assessment is None:
         return []
 
     # Progressive escalation (urgent schedule, 2hr window)
     history = get_alert_history(conn, "LOW_WARNING", hours=2.0)
     should_fire, level = should_escalate(history, SCHEDULE_URGENT)
-
     if not should_fire:
         return []
 
-    # Follow-up re-check: if BG has stabilized since initial alert, suppress
-    if level > 0 and current_bg >= 80 and description in ("stable", "rising"):
-        return []
+    current_time = fmt_time_ny(trend["current_ts"])
+    arrow = trend["arrow"]
+    iob, iob_src = current_iob(conn)
+    iob_note = f"IOB {iob}u" + (" (Trio net)" if iob_src == "trio" else " (est.)")
+    since = ""
+    if level > 0 and history:
+        since = f" — first alert {fmt_time_ny(history[0]['triggered_at'])}"
 
-    current_time = fmt_time_ny(current_ts)
+    tier = assessment["tier"]
+    loop_note = describe_loop_action(assessment.get("loop"))
 
-    if level == 0:
-        if iob > 0:
-            iob_note = f"IOB ~{iob}u (est. further drop ~{est_drop} mg/dL)."
-        else:
-            iob_note = ""
-
-        if condition_a or condition_c:
-            msg = (
-                f"\u26a0\ufe0f Low warning: BG {current_bg}{trend['arrow']} and falling "
-                f"({rate:+.0f}/15min, projected {round(projected_bg)} in 15min). {iob_note}\n"
-                f"~15-20g fast carbs recommended."
-            )
-        else:
-            # condition_b: IOB-based trigger
-            msg = (
-                f"\u26a0\ufe0f Low warning: BG {current_bg}{trend['arrow']} with active insulin. "
-                f"{iob_note}\n"
-                f"Consider fast carbs — IOB may push BG lower."
-            )
-    else:
-        # Level 1+: show previous BG if available
-        prev_note = ""
-        if history:
-            first_time = fmt_time_ny(history[0]["triggered_at"])
-            prev_note = f" (first alert at {first_time})"
-
-        if iob > 0:
-            iob_note = f"IOB ~{iob}u."
-        else:
-            iob_note = ""
-
+    if tier == "URGENT":
         msg = (
-            f"\u26a0\ufe0f Still trending low: BG {current_bg}{trend['arrow']} "
-            f"({current_time}){prev_note}. {iob_note}\n"
-            f"~15g fast carbs suggested."
+            f"\U0001f6a8 LOW: BG {current_bg}{arrow} ({current_time}){since}. "
+            f"{iob_note}, {loop_note}.\n"
+            f"15g fast carbs now."
+        )
+    elif tier == "CARBS_REQ":
+        pred = assessment.get("pred_min")
+        pred_note = f" (predicted nadir ~{pred:.0f})" if pred is not None else ""
+        msg = (
+            f"\u26a0\ufe0f Trio says ~{assessment['carbs_req']}g carbs needed to correct.\n"
+            f"BG {current_bg}{arrow} ({current_time}){since} — "
+            f"{loop_note}, still predicts a low{pred_note}. {iob_note}."
+        )
+    elif tier == "PREDICTED":
+        msg = (
+            f"\u26a0\ufe0f Low likely: BG {current_bg}{arrow} ({current_time}){since}. "
+            f"Trio predicts ~{assessment['pred_min']:.0f} within the hour despite {loop_note}. "
+            f"{iob_note}.\n"
+            f"~10-15g carbs recommended."
+        )
+    else:  # FALLBACK — no loop visibility
+        hist = assessment.get("hist")
+        hist_note = ""
+        if hist is not None:
+            hist_note = (f" Similar drops: {hist['went_low']} of {hist['episodes']} "
+                         f"reached <70 (median nadir {hist['median_nadir']}).")
+        msg = (
+            f"\u26a0\ufe0f Possible low: BG {current_bg}{arrow} ({current_time}){since}, "
+            f"falling {rate:+.0f}/15min — no loop data to confirm. {iob_note}.{hist_note}\n"
+            f"~15g fast carbs if it keeps dropping."
         )
 
     return [{"rule": "LOW_WARNING", "message": msg}]
@@ -1288,7 +1357,7 @@ def main():
     parser.add_argument("--dry-run", action="store_true",
                         help="Print alerts without sending or logging")
     parser.add_argument("--snooze", type=str, metavar="RULE",
-                        help="Snooze a rule (e.g., SUSTAINED_HIGH or ALL)")
+                        help="Snooze a rule (e.g., HIGH_STUCK or ALL)")
     parser.add_argument("--snooze-duration", type=int, default=120,
                         help="Snooze duration in minutes (default: 120)")
     parser.add_argument("--snooze-status", action="store_true",
@@ -1322,13 +1391,11 @@ def main():
     # Run all rules and collect alerts
     all_alerts = []
     rules = [
-        ("POST_MEAL_SPIKE", rule_post_meal_spike),
-        ("SUSTAINED_HIGH", rule_sustained_high),
+        ("HIGH_STUCK", rule_high_stuck),
         ("RAPID_DROP", rule_rapid_drop),
         # PRE_WORKOUT_LOW_RISK: disabled from auto-monitor.
         # Only triggered when user explicitly says they're about to work out.
         # ("PRE_WORKOUT_LOW_RISK", rule_pre_workout_low_risk),
-        ("OVERNIGHT_HIGH", rule_overnight_high),
         ("LOW_WARNING", rule_low_warning),
         # Nightscout pump/loop rules (no-op if nightscout isn't configured)
         ("LOW_RESERVOIR", rule_low_reservoir),

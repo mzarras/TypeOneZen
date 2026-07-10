@@ -222,6 +222,17 @@ def get_workout_bg(workout):
 
 
 def get_iob():
+    # Prefer Trio's own net IOB from Nightscout — it accounts for basal
+    # suspensions/temp adjustments the bolus-only decay estimate can't see.
+    try:
+        from nightscout_client import NightscoutClient
+        loop = NightscoutClient.from_env().loop()
+        age = loop.get("data_age_minutes") if loop else None
+        if loop and loop.get("iob") is not None and age is not None and age <= 15:
+            return round(float(loop["iob"]), 2)
+    except Exception:
+        pass
+
     cutoff = now_ny() - timedelta(hours=AIT_HOURS)
     conn = get_db()
     rows = conn.execute(
