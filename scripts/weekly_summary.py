@@ -680,16 +680,38 @@ def build_message(stats):
 
 # ── Sending ──────────────────────────────────────────────────────────────────
 
-def send_imessage(message):
+def render_weekly_chart(conn, week_ending):
+    """Render the week-vs-week comparison PNG. Returns a path or None —
+    the chart is a bonus attachment; the text summary must send regardless,
+    so this never raises (missing matplotlib, empty prior week, etc.)."""
+    try:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        from render_bg_chart import render_comparison
+        png, _ = render_comparison(
+            conn, week_ending, 7,
+            label_prior="Last week", label_current="This week",
+            title="Weekly Report",
+        )
+        return str(png)
+    except Exception as e:
+        logger.warning("weekly chart render failed (%s) — sending text only", e)
+        return None
+
+
+def send_imessage(message, file=None):
     if not PHONE:
         print("Error: ALERT_PHONE must be set in .env")
         logger.error("ALERT_PHONE not set; cannot send weekly summary")
         return False
 
+    cmd = [IMSG, "send", "--to", PHONE, "--text", message]
+    if file:
+        cmd += ["--file", file]
+
     attempts = 3
     for attempt in range(1, attempts + 1):
         result = subprocess.run(
-            [IMSG, "send", "--to", PHONE, "--text", message],
+            cmd,
             capture_output=True, text=True,
         )
         if result.returncode == 0:
@@ -727,6 +749,7 @@ def main():
     conn = get_db()
     try:
         stats = build_weekly_stats(conn, week_ending)
+        chart = render_weekly_chart(conn, week_ending) if stats else None
     finally:
         conn.close()
 
@@ -743,13 +766,14 @@ def main():
     print(message)
     print("=" * 60)
     print(f"[{len(message)} chars]")
+    print(f"[chart: {chart or 'none — text only'}]")
 
     if args.dry_run:
         print("[DRY RUN — not sent]")
         logger.info("Dry run for week ending %s — not sent", week_ending)
         return
 
-    send_imessage(message)
+    send_imessage(message, file=chart)
 
 
 if __name__ == "__main__":

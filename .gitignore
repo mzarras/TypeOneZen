@@ -40,3 +40,6 @@ planning/
 
 # DB backups (contain personal health data)
 data/*.bak
+
+# Rendered chart images (regenerated on demand)
+media/

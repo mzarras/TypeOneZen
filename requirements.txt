@@ -6,3 +6,4 @@ requests>=2.28.0
 #   pip3 install -e ../nightscout-client
 # or: pip3 install git+https://github.com/mzarras/nightscout-client.git
 nightscout-client
+matplotlib>=3.8

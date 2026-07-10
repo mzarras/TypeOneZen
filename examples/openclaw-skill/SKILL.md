@@ -76,6 +76,7 @@ All scripts: `python3 ~/.openclaw/workspace/skills/typeonezen/scripts/<script>.p
 | "bg stats last N hours" / "time in range" / "TIR" | `tz_query.py range <hours>` |
 | "recent workouts" / "did I exercise" | `tz_query.py workouts <days>` |
 | "sync my watch" / "just finished a workout" (COROS) | `python3 ~/TypeOneZen/parsers/fetch_coros.py --days 3` (then `tz_query.py workouts 1` to confirm it landed) |
+| "make a graphic/chart of my sugars" / "compare last N days" / "show me a visual" | `python3 ~/TypeOneZen/scripts/render_bg_chart.py --mode compare --days N` (or `--mode week`), then send per **Sending graphics** below |
 | "health summary" / "overall status" | `tz_query.py summary` |
 | "run the monitor" / "check alert rules now" | `tz_query.py monitor` |
 | "why did my loop bolus" / "why did my loop do X" / "autosens" | `nscli loop` — quote the `reason` field |
@@ -122,3 +123,18 @@ These exist for when Nightscout sync is unavailable. Do not use them while Night
 
 - **Omnipod screenshot logging (LEGACY)**: If the user sends an Omnipod app screenshot (History → Summary: Total Insulin / Basal / Bolus / TIR) and Nightscout has been down, parse it and call `python3 ~/TypeOneZen/scripts/log_omnipod_screenshot.py --date YYYY-MM-DD --basal X --total-insulin X --bolus X --carbs X --tir X --avg-bg X --above-range X --below-range X`. Normally, insulin data arrives automatically via `ns_sync.py` — only use this if Nightscout is confirmed down (`nscli status` fails).
 - **Photo meal logging**: Send Zenbot a food photo — estimate macros (carbs, protein, fat, fiber, calories) with vision, state the estimate, and **always confirm with the user before logging** via `tz_log.py meal`. If the user corrects an estimate ("more like 60g carbs"), update before writing.
+
+## Sending graphics
+
+`render_bg_chart.py` renders a BG comparison PNG (hourly median profile overlay + stat deltas) and prints JSON: `{"png": path, "current": {...}, "prior": {...}}`.
+
+- `--mode compare --days N [--end YYYY-MM-DD]` — last N days vs the N before
+- `--mode week [--week-ending YYYY-MM-DD]` — trailing week vs prior week (same graphic the Sunday weekly summary attaches)
+
+**Delivery rule (important):** send the PNG with the imsg CLI directly, handle-targeted:
+
+```
+/opt/homebrew/bin/imsg send --to <user's phone> --text "<one-line takeaway>" --file <png path>
+```
+
+Do NOT attach the image to your normal channel reply — on this Mac, OpenClaw attachment/threaded replies go through an AppleScript path that fails silently (bridge transport needs SIP off; fixed upstream in OpenClaw ≥ 2026.7.1). Until that upgrade is installed, the imsg CLI direct send is the only reliable image path. After sending via the CLI, your channel reply should just be the text commentary (no attachment), e.g. the takeaway plus any numbers worth calling out.

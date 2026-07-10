@@ -305,3 +305,57 @@ def test_workout_day_tir_comparison(conn):
     assert stats["workout_bg"]["workout_tir"] > stats["workout_bg"]["rest_tir"]
     msg = ws.build_message(stats)
     assert "Workout days:" in msg and "rest days" in msg
+
+
+# ── Chart rendering ──────────────────────────────────────────────────────────
+
+def test_render_comparison_produces_png(conn, tmp_path):
+    pytest.importorskip("matplotlib")
+    import importlib.util
+    spec = importlib.util.spec_from_file_location(
+        "render_bg_chart",
+        Path(__file__).resolve().parent.parent / "scripts" / "render_bg_chart.py")
+    rc = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(rc)
+
+    seed_glucose(conn, build_this_week_values())
+    seed_glucose(conn, build_last_week_values())
+
+    out = tmp_path / "chart.png"
+    png, stats = rc.render_comparison(conn, WEEK_ENDING, 7,
+                                      label_prior="Last week",
+                                      label_current="This week",
+                                      title="Weekly Report", out_path=out)
+    assert out.exists() and out.stat().st_size > 20_000
+    assert stats["current"]["tir"] < 100  # planted high block
+    assert stats["prior"]["tir"] == 100   # flat 130 baseline
+
+
+def test_weekly_send_attaches_chart(seeded, monkeypatch, tmp_path):
+    # main() should pass the rendered chart path to send_imessage.
+    fake_png = tmp_path / "weekly.png"
+    fake_png.write_bytes(b"png")
+    sent = {}
+    monkeypatch.setattr(ws, "render_weekly_chart", lambda conn, we: str(fake_png))
+    monkeypatch.setattr(ws, "send_imessage",
+                        lambda message, file=None: sent.update(m=message, f=file) or True)
+    monkeypatch.setattr(ws, "get_db", lambda: seeded)
+    monkeypatch.setattr(sys, "argv",
+                        ["weekly_summary.py", "--week-ending", WEEK_ENDING.isoformat()])
+    # main() closes the conn; reopen guard: seeded fixture conn is per-test
+    ws.main()
+    assert sent["f"] == str(fake_png)
+    assert "Weekly report" in sent["m"]
+
+
+def test_weekly_chart_failure_still_sends_text(seeded, monkeypatch):
+    sent = {}
+    monkeypatch.setattr(ws, "render_weekly_chart", lambda conn, we: None)
+    monkeypatch.setattr(ws, "send_imessage",
+                        lambda message, file=None: sent.update(m=message, f=file) or True)
+    monkeypatch.setattr(ws, "get_db", lambda: seeded)
+    monkeypatch.setattr(sys, "argv",
+                        ["weekly_summary.py", "--week-ending", WEEK_ENDING.isoformat()])
+    ws.main()
+    assert sent["f"] is None
+    assert "Weekly report" in sent["m"]
