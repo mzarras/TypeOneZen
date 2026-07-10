@@ -33,6 +33,7 @@ from __future__ import annotations
 import argparse
 import os
 import re
+import statistics
 import subprocess
 import sys
 import time
@@ -80,7 +81,6 @@ NO_DATA_MINUTES = 35         # newest reading older than this → data has gone
 # Trio's own predictions and only page when the loop itself can't fix it.
 LOW_URGENT_BG = 70           # below this: alert unconditionally
 LOW_NEAR_BG = 80             # near-low band where loop predictions decide
-PRED_SEVERE_BG = 60          # Trio-predicted nadir below this alerts from any BG
 LOOP_MAX_AGE_MINUTES = 15    # loop computation older than this → no loop visibility
 PRED_HORIZON_STEPS = 12      # 12 × 5-min steps = 60-min prediction window
 HIST_MIN_EPISODES = 10       # min similar past episodes to trust the pattern gate
@@ -267,18 +267,33 @@ def parse_carbs_req(reason: str | None) -> int | None:
 
 
 def loop_predicted_min(loop: dict | None) -> float | None:
-    """Trio's predicted BG minimum over the next PRED_HORIZON_STEPS×5 min.
+    """Trio's predicted BG minimum over the next PRED_HORIZON_STEPS×5 min,
+    read from the MIDDLE of the prediction cone: per 5-min step, take the
+    median across Trio's scenarios (IOB/ZT/COB/UAM), then the min over the
+    horizon. Falls back to eventual_bg if the arrays are absent.
 
-    Takes the min across all prediction scenarios (IOB/ZT/COB/UAM); falls
-    back to eventual_bg if the arrays are absent.
+    Never take the raw min across scenarios — they are alternate worlds,
+    not a confidence band. Post-meal the IOB-only curve models "all this
+    insulin, zero carbs absorbed" and routinely dips to ~40 while COB/UAM
+    from the same loop run predict 250+; the worst corner of that cone
+    produced 2 hours of "Low likely: BG 205, Trio predicts ~39" spam on
+    2026-07-10.
     """
     if loop is None:
         return None
     preds = loop.get("pred_bgs") or {}
-    mins = [min(arr[:PRED_HORIZON_STEPS]) for arr in preds.values() if arr]
-    if mins:
-        return float(min(mins))
-    return loop.get("eventual_bg")
+    arrays = [arr for arr in preds.values() if arr]
+    if not arrays:
+        return loop.get("eventual_bg")
+    horizon = min(PRED_HORIZON_STEPS, max(len(a) for a in arrays))
+    step_medians = []
+    for i in range(horizon):
+        vals = [a[i] for a in arrays if len(a) > i]
+        if vals:
+            step_medians.append(statistics.median(vals))
+    if not step_medians:
+        return loop.get("eventual_bg")
+    return float(min(step_medians))
 
 
 def describe_loop_action(loop: dict | None) -> str:
@@ -1062,9 +1077,10 @@ def assess_low_risk(conn, current_bg: float, rate_per_15: float,
       URGENT    — BG already < LOW_URGENT_BG: always alert.
       CARBS_REQ — Trio's own algorithm says carbs are required (its
                   zero-temp isn't enough). The canonical "you must act" signal.
-      PREDICTED — near-low (BG < LOW_NEAR_BG) with Trio predicting < 70
-                  within the hour, or a predicted nadir < PRED_SEVERE_BG
-                  from any BG.
+      PREDICTED — near-low NOW (BG < LOW_NEAR_BG, not rising) with the
+                  middle of Trio's prediction cone dipping < 70 within the
+                  hour. Never fires from an in-range or rising BG — a scary
+                  worst-case scenario curve alone is not an alert.
       FALLBACK  — no fresh loop data: CGM-only projection, gated by how
                   similar drops resolved in this user's own history.
 
@@ -1084,10 +1100,11 @@ def assess_low_risk(conn, current_bg: float, rate_per_15: float,
             return {"tier": "CARBS_REQ", "carbs_req": carbs_req,
                     "pred_min": pred_min, "loop": loop}
         if pred_min is not None:
-            if (current_bg < LOW_NEAR_BG and pred_min < LOW_URGENT_BG) \
-                    or pred_min < PRED_SEVERE_BG:
+            rising = rate_per_15 > 5
+            if (current_bg < LOW_NEAR_BG and not rising
+                    and pred_min < LOW_URGENT_BG):
                 return {"tier": "PREDICTED", "pred_min": pred_min, "loop": loop}
-            return None  # Trio sees the drop and predicts self-resolution
+            return None  # in range / rising / cone-middle predicts self-resolution
         # loop fresh but no predictions → fall through to CGM-only logic
 
     falling = description == "falling"

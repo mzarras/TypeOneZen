@@ -757,3 +757,70 @@ def test_send_imsg_reraises_after_three_failures(monkeypatch):
 
     assert calls["run"] == 3
     assert sleeps == [10, 30]
+
+
+# ── Prediction-cone regression (2026-07-10 post-meal spam) ───────────
+#
+# Trio's pred_bgs arrays are alternate scenarios, not a confidence band.
+# Post-meal, the IOB-only curve ("all insulin, zero carbs") dips to ~39
+# while COB/UAM predict 250+ from the same loop run. Reading the worst
+# corner of that cone produced 2 hours of "Low likely: BG 205, Trio
+# predicts ~39" alerts. The fix: per-step median across scenarios
+# (the middle of the cone), and PREDICTED only from a near-low, not-rising
+# BG.
+
+POSTMEAL_CONE = {
+    "IOB": [94, 80, 65, 52, 45, 39, 39, 42, 48, 55, 63, 70],
+    "COB": [94, 110, 135, 165, 200, 230, 255, 270, 280, 285, 285, 280],
+    "UAM": [94, 105, 125, 150, 175, 200, 220, 235, 245, 250, 250, 245],
+    "ZT":  [94, 88, 83, 79, 76, 74, 73, 73, 74, 76, 79, 82],
+}
+
+
+def test_cone_middle_not_worst_case():
+    loop = make_loop(pred_bgs=POSTMEAL_CONE)
+    pred_min = monitor.loop_predicted_min(loop)
+    # medians per step never dip below ~85; worst-case corner is 39
+    assert pred_min > 80
+
+
+def test_postmeal_cone_gap_does_not_alert(conn):
+    # 1:24pm real case: BG 94 steady, meal bolus on board (IOB 12u, COB 40g),
+    # basal suspended, IOB-scenario predicting 39 → must NOT alert.
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=10)).isoformat(), 96)
+    insert_reading(conn, (now - timedelta(minutes=5)).isoformat(), 95)
+    insert_reading(conn, now.isoformat(), 94)
+    set_loop_state(make_loop(bg=94.0, iob=12.0, cob=40.0, temp_rate=0.0,
+                             eventual_bg=210.0, pred_bgs=POSTMEAL_CONE))
+
+    assert monitor.rule_low_warning(conn) == []
+
+
+def test_low_pred_ignored_when_high_and_rising(conn):
+    # 3:39pm real case: BG 205 and climbing — "Low likely" is absurd here
+    # no matter what the worst scenario curve says.
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=10)).isoformat(), 160)
+    insert_reading(conn, (now - timedelta(minutes=5)).isoformat(), 180)
+    insert_reading(conn, now.isoformat(), 205)
+    set_loop_state(make_loop(bg=205.0, iob=10.4, cob=25.0, temp_rate=0.0,
+                             eventual_bg=170.0, pred_bgs=POSTMEAL_CONE))
+
+    assert monitor.rule_low_warning(conn) == []
+
+
+def test_predicted_low_still_fires_when_scenarios_agree(conn):
+    # All scenarios dipping below 70 from a near-low, non-rising BG → real.
+    now = datetime.now(UTC)
+    insert_reading(conn, (now - timedelta(minutes=5)).isoformat(), 80)
+    insert_reading(conn, now.isoformat(), 76)
+    agree = {
+        "IOB": [76, 70, 64, 60, 58, 60, 65, 72],
+        "ZT":  [76, 71, 66, 63, 62, 64, 68, 74],
+    }
+    set_loop_state(make_loop(bg=76.0, eventual_bg=75.0, pred_bgs=agree))
+
+    alerts = monitor.rule_low_warning(conn)
+    assert len(alerts) == 1
+    assert "Low likely" in alerts[0]["message"]
