@@ -37,3 +37,6 @@ __pycache__/
 # Working notes
 plan.md
 planning/
+
+# DB backups (contain personal health data)
+data/*.bak
