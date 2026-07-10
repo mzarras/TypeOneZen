@@ -229,3 +229,79 @@ def test_dry_run_never_sends(seeded, monkeypatch):
     ws.main()
 
     assert called["sent"] is False
+
+
+# ── Fitness section ──────────────────────────────────────────────────────────
+
+def insert_workout(conn, started_ny, minutes, activity="running", distance_m=None):
+    import json as _json
+    ended_ny = started_ny + timedelta(minutes=minutes)
+    notes = _json.dumps({"total_distance": distance_m} if distance_m else {})
+    conn.execute(
+        "INSERT INTO workouts (started_at, ended_at, activity_type, intensity, notes)"
+        " VALUES (?, ?, ?, 'high', ?)",
+        (ws.to_utc_str(started_ny), ws.to_utc_str(ended_ny), activity, notes),
+    )
+    conn.commit()
+
+
+def test_workout_stats_aggregation(conn):
+    insert_workout(conn, ny_dt(THIS_START + timedelta(days=1), 17, 0), 45, "running", 8000)
+    insert_workout(conn, ny_dt(THIS_START + timedelta(days=3), 17, 0), 30, "running", 5000)
+    insert_workout(conn, ny_dt(THIS_START + timedelta(days=5), 9, 0), 60, "cycling", 24000)
+
+    stats = ws.workout_stats(conn, ws.ny_midnight(THIS_START),
+                             ws.ny_midnight(WEEK_ENDING + timedelta(days=1)))
+    assert stats["count"] == 3
+    assert round(stats["total_min"]) == 135
+    assert stats["by_activity"]["running"]["count"] == 2
+    assert round(stats["by_activity"]["running"]["km"], 1) == 13.0
+    assert stats["by_activity"]["cycling"]["count"] == 1
+    assert len(stats["days"]) == 3
+
+
+def test_message_includes_fitness_line(seeded):
+    insert_workout(seeded, ny_dt(THIS_START + timedelta(days=1), 17, 0), 45, "running", 8000)
+    insert_workout(seeded, ny_dt(THIS_START + timedelta(days=3), 17, 0), 30, "running", 5000)
+
+    stats = ws.build_weekly_stats(seeded, WEEK_ENDING)
+    msg = ws.build_message(stats)
+    assert "🏃 Activity: 2 workouts" in msg
+    assert "2 runs (13.0 km)" in msg
+    assert "1h 15m" in msg
+    assert "(+2 vs last week)" in msg
+
+
+def test_fitness_line_notes_missing_week(seeded):
+    insert_workout(seeded, ny_dt(LAST_START + timedelta(days=1), 17, 0), 45)
+
+    stats = ws.build_weekly_stats(seeded, WEEK_ENDING)
+    msg = ws.build_message(stats)
+    assert "no workouts this week (last week: 1)" in msg
+
+
+def test_fitness_section_absent_when_both_weeks_empty(seeded):
+    stats = ws.build_weekly_stats(seeded, WEEK_ENDING)
+    msg = ws.build_message(stats)
+    assert "🏃" not in msg
+
+
+def test_workout_day_tir_comparison(conn):
+    # Rest days carry the seeded daily 2-5pm high block; workout days are
+    # overwritten to flat 120 (100% TIR) -> comparison line should appear
+    # and favor workout days.
+    values = build_this_week_values()
+    workout_days = {THIS_START + timedelta(days=2), THIS_START + timedelta(days=4)}
+    for ts in list(values):
+        if ts.date() in workout_days:
+            values[ts] = 120
+    seed_glucose(conn, values)
+    seed_glucose(conn, build_last_week_values())
+    for d in workout_days:
+        insert_workout(conn, ny_dt(d, 17, 0), 45, "running", 8000)
+
+    stats = ws.build_weekly_stats(conn, WEEK_ENDING)
+    assert stats["workout_bg"] is not None
+    assert stats["workout_bg"]["workout_tir"] > stats["workout_bg"]["rest_tir"]
+    msg = ws.build_message(stats)
+    assert "Workout days:" in msg and "rest days" in msg

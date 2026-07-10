@@ -12,6 +12,7 @@ Usage:
 """
 
 import argparse
+import json
 import logging
 import os
 import statistics
@@ -234,6 +235,70 @@ def insulin_coverage_complete(stats, window_start_ny, tolerance_hours=6):
     return (stats["earliest_ny"] - window_start_ny) <= timedelta(hours=tolerance_hours)
 
 
+# ── Workouts ─────────────────────────────────────────────────────────────────
+
+ACTIVITY_LABELS = {
+    "running": "run", "cycling": "ride", "walking": "walk",
+    "alpine_skiing": "ski", "cardio_training": "cardio",
+}
+
+
+def fmt_duration(minutes):
+    minutes = int(round(minutes))
+    if minutes < 60:
+        return f"{minutes}m"
+    h, m = divmod(minutes, 60)
+    return f"{h}h {m:02d}m" if m else f"{h}h"
+
+
+def workout_stats(conn, start_ny, end_ny):
+    """Workouts (Garmin/COROS/HealthKit imports) in the window: count, total
+    minutes, per-activity breakdown, and the set of NY dates with a workout."""
+    rows = conn.execute(
+        "SELECT activity_type, started_at, ended_at, notes FROM workouts "
+        "WHERE started_at >= ? AND started_at < ? ORDER BY started_at",
+        (to_utc_str(start_ny), to_utc_str(end_ny)),
+    ).fetchall()
+
+    total_min = 0.0
+    by_activity = {}
+    days = set()
+    for r in rows:
+        s = from_utc_str(r["started_at"])
+        e = from_utc_str(r["ended_at"])
+        dur = (e - s).total_seconds() / 60 if s and e else 0.0
+        notes = {}
+        try:
+            notes = json.loads(r["notes"] or "{}")
+        except Exception:
+            pass
+        dist = notes.get("total_distance")
+        km = float(dist) / 1000 if dist else 0.0
+
+        activity = r["activity_type"] or "other"
+        agg = by_activity.setdefault(activity, {"count": 0, "minutes": 0.0, "km": 0.0})
+        agg["count"] += 1
+        agg["minutes"] += dur
+        agg["km"] += km
+        total_min += dur
+        if s:
+            days.add(s.date())
+
+    return {"count": len(rows), "total_min": total_min,
+            "by_activity": by_activity, "days": days}
+
+
+def workout_day_tir(day_stats, workout_days):
+    """Mean daily TIR on workout days vs rest days. Needs >=2 of each with
+    full-enough CGM coverage (day_stats is already filtered to n>=100)."""
+    on = [s["tir"] for d, s in day_stats.items() if d in workout_days]
+    off = [s["tir"] for d, s in day_stats.items() if d not in workout_days]
+    if len(on) < 2 or len(off) < 2:
+        return None
+    return {"workout_tir": round(sum(on) / len(on), 1),
+            "rest_tir": round(sum(off) / len(off), 1)}
+
+
 # ── "Where to improve" candidates ───────────────────────────────────────────
 
 def worst_block_candidate(readings_this, week_stat, window_hours=3, min_n=100):
@@ -416,6 +481,11 @@ def build_weekly_stats(conn, end_date_ny):
             "window": window_label,
         }
 
+    # Workouts
+    workouts_this = workout_stats(conn, ny_midnight(this_start), ny_midnight(this_end_excl))
+    workouts_last = workout_stats(conn, ny_midnight(last_start), ny_midnight(last_end_excl))
+    workout_bg = workout_day_tir(day_stats, workouts_this["days"])
+
     # Where-to-improve candidates
     candidates = []
     c = worst_block_candidate(readings_this, this_stat)
@@ -464,6 +534,9 @@ def build_weekly_stats(conn, end_date_ny):
         "insulin_complete_last": insulin_complete_last,
         "best_day": best_day,
         "worst_day": worst_day,
+        "workouts_this": workouts_this,
+        "workouts_last": workouts_last,
+        "workout_bg": workout_bg,
         "improvements": improvements,
         "great_week": great_week,
     }
@@ -551,6 +624,34 @@ def build_message(stats):
             lines.append(f"Insulin: {tdd_day}u/day{tdd_delta} ({bolus_day}u bolus + {basal_day}u basal)")
         else:
             lines.append(f"Insulin: {tdd_day}u/day ({bolus_day}u bolus + {basal_day}u basal) — partial data since Jul 8")
+        lines.append("")
+
+    # Fitness
+    w_this = s.get("workouts_this") or {"count": 0}
+    w_last = s.get("workouts_last") or {"count": 0}
+    if w_this["count"] > 0:
+        parts = []
+        for activity, agg in sorted(w_this["by_activity"].items(),
+                                    key=lambda kv: kv[1]["minutes"], reverse=True):
+            label = ACTIVITY_LABELS.get(activity, "workout")
+            bit = f"{agg['count']} {label}{'s' if agg['count'] != 1 else ''}"
+            if agg["km"] > 0:
+                bit += f" ({agg['km']:.1f} km)"
+            parts.append(bit)
+        count_delta = ""
+        diff = w_this["count"] - w_last["count"]
+        if diff != 0:
+            count_delta = f" ({'+' if diff > 0 else ''}{diff} vs last week)"
+        lines.append(f"🏃 Activity: {w_this['count']} workout{'s' if w_this['count'] != 1 else ''} "
+                     f"· {fmt_duration(w_this['total_min'])}{count_delta} — {' · '.join(parts)}")
+        wbg = s.get("workout_bg")
+        if wbg:
+            gap = wbg["workout_tir"] - wbg["rest_tir"]
+            tag = " 🟢" if gap > 0 else ""
+            lines.append(f"Workout days: {wbg['workout_tir']:.0f}% TIR vs {wbg['rest_tir']:.0f}% on rest days{tag}")
+        lines.append("")
+    elif w_last["count"] > 0:
+        lines.append(f"🏃 Activity: no workouts this week (last week: {w_last['count']})")
         lines.append("")
 
     best_day = s["best_day"]
