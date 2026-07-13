@@ -163,6 +163,32 @@ Expect at least one chat listed (or an empty-but-successful result), not
 a permissions error. If you get a permissions error, re-check both
 Full Disk Access and Automation, then re-run.
 
+**Attachment sends from cron need Full Disk Access on the `imsg` binary
+itself.** Sending a *file* (the weekly report's BG chart) makes `imsg`
+copy it into `~/Library/Messages/Attachments/`, and TCC attributes that
+write to the `imsg` binary — not to cron, not to your terminal. From a
+cron context there is no permission prompt: the send just fails with
+`NSCocoaErrorDomain Code=513 "You don't have permission to save the
+file …"` in the log (text-only sends keep working, so this is easy to
+miss). Grant it during setup:
+
+1. **System Settings > Privacy & Security > Full Disk Access** — click
+   `+`, press ⌘⇧G in the file picker, and add both:
+   - `/usr/sbin/cron`
+   - the real `imsg` binary: `ls /opt/homebrew/Cellar/imsg/*/libexec/imsg`
+     for the path (the `/opt/homebrew/bin/imsg` symlink resolves to it).
+   (If an attachment send has already failed once, `imsg` appears in the
+   list on its own, toggled off — just enable it.)
+2. Verify from a real cron context, not your shell — your terminal's own
+   FDA masks the problem interactively. Add a temporary one-shot crontab
+   line that runs `imsg send --to <you> --text test --file <some.png>`
+   a minute or two out, confirm delivery, then remove it.
+
+The grant is pinned to the versioned binary path, so `brew upgrade imsg`
+silently revokes it — re-add after upgrades. If the grant is missing,
+`scripts/weekly_summary.py` still delivers the text summary and just
+drops the chart.
+
 ### 0.7 Anthropic API key
 
 Get a key from https://console.anthropic.com (API Keys section). This is

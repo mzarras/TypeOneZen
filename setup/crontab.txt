@@ -39,7 +39,10 @@ PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 # Evening daily summary (iMessage, includes overnight risk flag) at 9pm
 0 21 * * * cd ~/TypeOneZen && python3 scripts/daily_summary.py --period evening >> logs/cron.log 2>&1
 
-# Weekly summary (iMessage, trailing 7 days vs the 7 before) — Sundays at 6pm
+# Weekly summary (iMessage, trailing 7 days vs the 7 before) — Sundays at 6pm.
+# Includes a chart attachment: sending files requires Full Disk Access on the
+# imsg binary itself (and /usr/sbin/cron) or the whole send fails under cron —
+# see "Attachment sends from cron" in setup/SETUP.md §0.6.
 0 18 * * 0 cd ~/TypeOneZen && python3 scripts/weekly_summary.py >> logs/cron.log 2>&1
 
 # Nightly memory file for the OpenClaw agent (~/.openclaw/workspace/memory/YYYY-MM-DD.md) at 10:30pm
