@@ -704,24 +704,32 @@ def send_imessage(message, file=None):
         logger.error("ALERT_PHONE not set; cannot send weekly summary")
         return False
 
-    cmd = [IMSG, "send", "--to", PHONE, "--text", message]
-    if file:
-        cmd += ["--file", file]
-
     attempts = 3
+    dropped_chart = False
     for attempt in range(1, attempts + 1):
+        cmd = [IMSG, "send", "--to", PHONE, "--text", message]
+        if file:
+            cmd += ["--file", file]
         result = subprocess.run(
             cmd,
             capture_output=True, text=True,
         )
         if result.returncode == 0:
-            print("✅ Sent via iMessage")
-            logger.info("Weekly summary sent via iMessage")
+            suffix = " (text only, chart dropped)" if dropped_chart else ""
+            print(f"✅ Sent via iMessage{suffix}")
+            logger.info("Weekly summary sent via iMessage%s", suffix)
             return True
         detail = " | ".join(p for p in (result.stdout.strip(), result.stderr.strip()) if p)
         msg = f"❌ Send failed (attempt {attempt}/{attempts}, exit {result.returncode}): {detail or '(no output)'}"
         print(msg)
         logger.warning(msg)
+        if file:
+            # Attachment sends need Full Disk Access the cron context may lack;
+            # the text summary must go out regardless, so retry without the chart.
+            logger.warning("retrying without chart attachment")
+            file = None
+            dropped_chart = True
+            continue
         if attempt < attempts:
             time.sleep(30)
     logger.error("Weekly summary failed to send after %d attempts", attempts)
