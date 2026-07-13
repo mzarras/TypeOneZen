@@ -229,6 +229,7 @@ def parse_fit_file(fit_path: Path) -> dict | None:
         "total_ascent": session_data.get("total_ascent"),
         "total_descent": session_data.get("total_descent"),
         "total_elapsed_time": session_data.get("total_elapsed_time"),
+        "total_timer_time": session_data.get("total_timer_time"),
         "sport": sport,
         "sub_sport": sub_sport if sub_sport and sub_sport != "generic" else None,
         "avg_running_cadence": session_data.get("avg_running_cadence"),
